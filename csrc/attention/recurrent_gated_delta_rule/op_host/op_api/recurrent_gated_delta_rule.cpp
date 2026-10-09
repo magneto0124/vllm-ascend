@@ -29,10 +29,11 @@ OP_TYPE_REGISTER(RecurrentGatedDeltaRule);
 const aclTensor *RecurrentGatedDeltaRule(const aclTensor *query, const aclTensor *key, const aclTensor *value,
                                          const aclTensor *beta, aclTensor *stateRef, const aclTensor *actualSeqLengths,
                                          const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
-                                         const aclTensor *numAcceptedTokens, float scaleValue, aclOpExecutor *executor)
+                                         const aclTensor *numAcceptedTokens, const aclTensor *initStateIndices,
+                                         float scaleValue, aclOpExecutor *executor)
 {
     L0_DFX(RecurrentGatedDeltaRule, query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
-           numAcceptedTokens, scaleValue);
+           numAcceptedTokens, initStateIndices, scaleValue);
 
     DataType outType = DataType::DT_BF16;
     Format format = Format::FORMAT_ND;
@@ -45,13 +46,15 @@ const aclTensor *RecurrentGatedDeltaRule(const aclTensor *query, const aclTensor
     // infershape
     auto ret = INFER_SHAPE(
         RecurrentGatedDeltaRule,
-        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens),
+        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,
+                 initStateIndices),
         OP_OUTPUT(out, stateRef), OP_ATTR(scaleValue));
     OP_CHECK_INFERSHAPE(ret != ACLNN_SUCCESS, return nullptr, "RecurrentGatedDeltaRule InferShape failed.");
 
     ret = ADD_TO_LAUNCHER_LIST_AICORE(
         RecurrentGatedDeltaRule,
-        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens),
+        OP_INPUT(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,
+                 initStateIndices),
         OP_OUTPUT(out, stateRef), OP_ATTR(scaleValue));
     OP_CHECK_ADD_TO_LAUNCHER_LIST_AICORE(ret != ACLNN_SUCCESS, return nullptr,
                                          "RecurrentGatedDeltaRule ADD_TO_LAUNCHER_LIST_AICORE failed.");

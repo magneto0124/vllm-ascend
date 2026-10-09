@@ -1,6 +1,10 @@
 import logging
 
 import torch
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
+)
 
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     iter_unique_kv_cache_tensors,
@@ -88,8 +92,17 @@ class TreeKvCompact:
             return
         ctx = self.runner.compilation_config.static_forward_context
         groups = []
-        seen: set[int] = set()
+        # K and V are often separate views of the same hybrid allocation.
+        # A storage pointer identifies the allocation, not a cache view.
+        seen: set[tuple[int, tuple[int, ...], tuple[int, ...], torch.dtype]] = set()
         for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+            # Hybrid models wrap per-layer specs in UniformTypeKVCacheSpecs.
+            # Checking only ``isinstance(..., MambaSpec)`` misses those groups
+            # and treats recurrent state pages as token-addressed attention KV.
+            if get_kv_cache_spec_kind(group.kv_cache_spec) == KVCacheSpecKind.MAMBA:
+                # Mamba state pages are addressed by request state slot, not by
+                # token position, so the prefix/node slot move must skip them.
+                continue
             caches: list[torch.Tensor] = []
             gathers: list[torch.Tensor] = []
             for layer_name in group.layer_names:
@@ -99,10 +112,15 @@ class TreeKvCompact:
                 for tensor in iter_unique_kv_cache_tensors(
                     getattr(layer, "kv_cache", None)
                 ):
-                    ptr = tensor.untyped_storage().data_ptr()
-                    if ptr in seen:
+                    cache_view = (
+                        tensor.data_ptr(),
+                        tuple(tensor.shape),
+                        tensor.stride(),
+                        tensor.dtype,
+                    )
+                    if cache_view in seen:
                         continue
-                    seen.add(ptr)
+                    seen.add(cache_view)
                     caches.append(tensor)
                     tail = tensor.shape[2:]
                     gathers.append(
@@ -134,7 +152,14 @@ class TreeKvCompact:
         dst_pos = prefix.unsqueeze(1) + self._depth
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
         valid = (path >= 0) & (idx >= 0).unsqueeze(1)
-        src_pos = torch.where(valid, src_pos, dst_pos)
+        # Rejected/padded path entries do not have allocated future KV slots.
+        # Map them to column 0 *before* indexing the block table: even the
+        # table column for prefix + depth can be out of range near max_model_len.
+        # Physical block 0 is vLLM's reserved null block; index 0 is a safe
+        # fixed-shape no-op for graph capture as well as eager execution.
+        zero_pos = torch.zeros_like(dst_pos)
+        src_pos = torch.where(valid, src_pos, zero_pos)
+        dst_pos = torch.where(valid, dst_pos, zero_pos)
         req_f = safe_idx.unsqueeze(1).expand(num_reqs, self.spec_len)
         for caches, block_table, block_size, gathers in self._groups:
             src_block = block_table[
@@ -143,12 +168,18 @@ class TreeKvCompact:
             dst_block = block_table[
                 req_f, torch.div(dst_pos, block_size, rounding_mode="floor")
             ]
-            src_flat = (src_block * block_size + src_pos % block_size).to(
-                dtype=torch.long
-            ).reshape(-1)
-            dst_flat = (dst_block * block_size + dst_pos % block_size).to(
-                dtype=torch.long
-            ).reshape(-1)
+            # Unallocated columns can contain stale block IDs. Invalid path
+            # slots must never pass them to the floating-point cache gather.
+            src_flat = torch.where(
+                valid,
+                src_block * block_size + src_pos % block_size,
+                zero_pos,
+            ).to(dtype=torch.long).reshape(-1)
+            dst_flat = torch.where(
+                valid,
+                dst_block * block_size + dst_pos % block_size,
+                zero_pos,
+            ).to(dtype=torch.long).reshape(-1)
             for cache, gather in zip(caches, gathers):
                 tail = cache.shape[2:]
                 flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)

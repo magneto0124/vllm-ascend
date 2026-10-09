@@ -25,6 +25,7 @@ def golden_recurrent_gated_delta_rule(
     ssm_state_indices,
     g,
     num_accepted_tokens,
+    init_state_indices=None,
 ):
     """Pure torch/CPU golden implementation of recurrent gated delta rule.
 
@@ -39,6 +40,8 @@ def golden_recurrent_gated_delta_rule(
         ssm_state_indices: [T] per-token state block index
         g: [T, nv] or None
         num_accepted_tokens: [batch_size] or None
+        init_state_indices: [T] per-token initial state page. When provided,
+            each token starts from its parent's state page, as in a draft tree.
 
     Returns:
         (output [T, nv, dv], updated_state [S, nv, dv, dk])
@@ -58,13 +61,28 @@ def golden_recurrent_gated_delta_rule(
 
     seq_start = 0
     for i in range(len(actual_seq_lengths)):
-        if num_accepted_tokens is None:
-            init_state = initial_state[ssm_state_indices[seq_start]]
-        else:
-            init_state = initial_state[ssm_state_indices[seq_start + num_accepted_tokens[i] - 1]]
+        if init_state_indices is None:
+            if num_accepted_tokens is None:
+                init_state = initial_state[ssm_state_indices[seq_start]]
+            else:
+                init_state = initial_state[
+                    ssm_state_indices[seq_start + num_accepted_tokens[i] - 1]
+                ]
         for head_id in range(n_heads_v):
-            S = init_state[head_id]
+            if init_state_indices is None:
+                S = init_state[head_id]
             for slot_id in range(seq_start, seq_start + actual_seq_lengths[i]):
+                if init_state_indices is not None:
+                    # A tree node starts from its parent's completed state. If
+                    # it branches away from the previous token, the kernel must
+                    # reload the state page from its storage dtype.
+                    parent_state_idx = init_state_indices[slot_id]
+                    S = initial_state[parent_state_idx][head_id]
+                    if (
+                        slot_id > seq_start
+                        and parent_state_idx != ssm_state_indices[slot_id - 1]
+                    ):
+                        S = S.to(state.dtype).to(torch.float32)
                 q_i = q[slot_id][head_id // (n_heads_v // n_heads_k)]
                 k_i = k[slot_id][head_id // (n_heads_v // n_heads_k)]
                 v_i = v[slot_id][head_id]
@@ -80,6 +98,88 @@ def golden_recurrent_gated_delta_rule(
         seq_start += actual_seq_lengths[i]
 
     return o.to(query.dtype), initial_state.to(query.dtype)
+
+
+@pytest.mark.parametrize("headnum", [(2, 4), (4, 8)])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_recurrent_gated_delta_rule_tree_sibling_state_isolation(
+    headnum,
+    state_dtype,
+):
+    """A sibling must reload its parent state, not inherit its prior sibling.
+
+    The flattened tree is [root, child_a, child_b]. Both children have the root
+    as parent, so child_b must start from the root page even though child_a is
+    the preceding token in the kernel's batch order.
+    """
+    torch.manual_seed(seed)
+    dtype = torch.bfloat16
+    headnum_k, headnum_v = headnum
+    seq_len = 3
+    headdim_k = headdim_v = 128
+
+    # Pages 0..2 receive this step's [root, child_a, child_b] outputs; page 3
+    # holds the accepted-prefix state from which the root starts.
+    state = torch.rand((4, headnum_v, headdim_v, headdim_k)).to(state_dtype)
+    query = torch.nn.functional.normalize(
+        torch.rand((seq_len, headnum_k, headdim_k)), p=2, dim=-1
+    ).to(dtype)
+    key = torch.nn.functional.normalize(
+        torch.rand((seq_len, headnum_k, headdim_k)), p=2, dim=-1
+    ).to(dtype)
+    value = torch.rand((seq_len, headnum_v, headdim_v)).to(dtype)
+    g = -torch.rand((seq_len, headnum_v), dtype=torch.float32)
+    beta = torch.rand((seq_len, headnum_v)).to(dtype)
+    state_indices = torch.tensor([0, 1, 2], dtype=torch.int32)
+    init_state_indices = torch.tensor([3, 0, 0], dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([1], dtype=torch.int32)
+    seq_lengths = torch.tensor([seq_len], dtype=torch.int32)
+    scale = headdim_k**-0.5
+
+    out_golden, state_golden = golden_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        state,
+        beta,
+        scale,
+        seq_lengths,
+        state_indices,
+        g,
+        num_accepted_tokens,
+        init_state_indices=init_state_indices,
+    )
+
+    actual_seq_lengths_npu = torch.tensor([0, seq_len], dtype=torch.int32).npu()
+    state_npu = state.npu()
+    npu_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+        query=query.npu(),
+        key=key.npu(),
+        value=value.npu(),
+        g=g.npu(),
+        beta=beta.npu(),
+        state=state_npu,
+        scale=scale,
+        actual_seq_lengths=actual_seq_lengths_npu,
+        ssm_state_indices=state_indices.npu(),
+        num_accepted_tokens=num_accepted_tokens.npu(),
+        init_state_indices=init_state_indices.npu(),
+    )
+
+    torch.testing.assert_close(
+        npu_out.to(torch.float32).cpu(),
+        out_golden.to(torch.float32),
+        rtol=3e-3,
+        atol=1e-2,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        state_npu.to(torch.float32).cpu(),
+        state_golden.to(torch.float32),
+        rtol=3e-3,
+        atol=1e-2,
+        equal_nan=True,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8])

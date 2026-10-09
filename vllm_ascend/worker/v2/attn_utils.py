@@ -28,6 +28,7 @@ import vllm
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.utils.torch_utils import get_dtype_size, get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
@@ -67,9 +68,68 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker.v2.mamba_mem_stats import (
+    kv_allocation_region,
+    record_mamba_allocation,
+)
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+
+
+def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
+    """Size a Mamba state spec for the ``tree_spec_config`` draft tree.
+
+    ``MambaBase.get_kv_cache_spec`` derives ``num_speculative_blocks`` (how many
+    recurrent state pages are kept per request) from ``num_speculative_tokens``,
+    which describes a linear draft chain. A draft tree verifies ``1 + budget``
+    nodes and every node keeps its own state slot, so the page count has to
+    follow the tree width instead.
+
+    The short-conv state also grows: the tree conv keeps the activations of all
+    ``1 + budget`` nodes of the step in the page (columns
+    ``width - 1 .. width - 1 + slots``) so the next step can rebuild the
+    committed history from whichever node the sampler accepted (see
+    ``ops/gdn.tree_causal_conv1d``). Every GDN layer gets the same width, which
+    keeps the mamba layers inside one uniform KV cache group.
+    """
+    from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+        tree_conv_width,
+        tree_state_slot_count,
+        validate_tree_state_slots,
+    )
+
+    slots = tree_state_slot_count(vllm_config)
+    if slots is None:
+        return spec
+    validate_tree_state_slots(slots, spec.mamba_type)
+
+    num_spec = vllm_config.speculative_config.num_speculative_tokens
+    if slots > spec.num_speculative_blocks + 1:
+        # One recurrent state page per tree node.
+        spec = replace(spec, num_speculative_blocks=slots - 1)
+
+    conv_state_shape = spec.shapes[0]
+    width = tree_conv_width(spec.mamba_type, tuple(conv_state_shape), num_spec)
+    # The tree verifies ``slots`` tokens per request, i.e. the page holds one
+    # conv-state column per node; a tree no wider than the draft chain needs no
+    # extra column, but it still needs them the moment it is one node wider.
+    extra_columns = slots - num_spec
+    if width is None or extra_columns <= 0:
+        return spec
+    # The conv dimension is the larger side; the extra node columns widen the
+    # page by exactly their bytes. ``shapes`` and ``dtypes`` are positional, so
+    # entry 0 is the conv state this branch widens.
+    conv_dim = max(conv_state_shape)
+    expected_columns = width - 1 + slots
+    conv_state_shape = (
+        (conv_dim, expected_columns) if is_conv_state_dim_first() else (expected_columns, conv_dim)
+    )
+    return replace(
+        spec,
+        shapes=(conv_state_shape, *spec.shapes[1:]),
+        page_size_padded=spec.page_size_padded + extra_columns * conv_dim * get_dtype_size(spec.dtypes[0]),
+    )
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -103,6 +163,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
         if isinstance(spec, MambaSpec):
+            spec = _widen_mamba_spec_for_tree(spec, vllm_config)
             # Keep Mamba groups after attention groups. Ascend graph parameter
             # updates rely on this stable backend ordering.
             mamba_specs[layer_name] = spec
@@ -887,11 +948,12 @@ def allocate_kv_cache_main(
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
 
-    raw_tensors = _allocate_kv_cache(
-        kv_cache_config,
-        shared_layers=shared_layers,
-        device=device,
-    )
+    with kv_allocation_region():
+        raw_tensors = _allocate_kv_cache(
+            kv_cache_config,
+            shared_layers=shared_layers,
+            device=device,
+        )
 
     attn_groups: list[AttentionGroup] = []
     for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
@@ -1099,6 +1161,15 @@ def _reshape_kv_cache_v2(
                 mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
                 if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
                     raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
+                # Account the real buffer and the views just carved out of it;
+                # a no-op unless additional_config.mamba_mem_stats_config is on.
+                record_mamba_allocation(
+                    layer_name,
+                    raw_cache,
+                    mamba_cache,
+                    kv_cache_spec,
+                    kv_cache_config.num_blocks,
+                )
                 kv_caches[layer_name] = mamba_cache
                 continue
 

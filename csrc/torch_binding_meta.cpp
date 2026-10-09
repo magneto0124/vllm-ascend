@@ -748,7 +748,8 @@ at::Tensor npu_recurrent_gated_delta_rule_meta(
     const c10::optional<at::Tensor>& ssm_state_indices,
     const c10::optional<at::Tensor>& num_accepted_tokens,
     const c10::optional<at::Tensor>& g,
-    const c10::optional<at::Tensor>& gk)
+    const c10::optional<at::Tensor>& gk,
+    const c10::optional<at::Tensor>& init_state_indices)
 {
 
     auto options = value.options().dtype(at::ScalarType::BFloat16);

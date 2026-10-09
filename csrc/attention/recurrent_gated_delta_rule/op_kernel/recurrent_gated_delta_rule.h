@@ -46,6 +46,7 @@ struct RGDRInitParams {
     GM_ADDR cuSeqlens;
     GM_ADDR ssmStateIndices;
     GM_ADDR numAcceptedTokens;
+    GM_ADDR initStateIndices;
     GM_ADDR attnOut;
     GM_ADDR finalState;
 };
@@ -63,6 +64,7 @@ public:
         realV_ = tilingData->dv;
         scale_ = tilingData->scale;
         hasAcceptedTokens_ = (tilingData->hasAcceptedTokens == 1);
+        hasInitStateIndices_ = (tilingData->hasInitStateIndices == 1);
         hasGama_ = (tilingData->hasGama == 1);
         hasGamaK_ = (tilingData->hasGamaK == 1);
         useAddFoldReduce_ = (RGDR_ENABLE_ADD_FOLD_REDUCE != 0);
@@ -100,6 +102,7 @@ public:
         cuSeqlensGm_.SetGlobalBuffer((__gm__ int32_t *)initParams.cuSeqlens);
         ssmStateIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)initParams.ssmStateIndices);
         numAcceptedTokensGm_.SetGlobalBuffer((__gm__ int32_t *)initParams.numAcceptedTokens);
+        initStateIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)initParams.initStateIndices);
         finalStateGm_.SetGlobalBuffer((__gm__ stateType *)initParams.finalState);
         attnOutGm_.SetGlobalBuffer((__gm__ outType *)initParams.attnOut);
     }
@@ -178,15 +181,26 @@ public:
                 }
                 copyFlag++;
                 if (copyFlag == 1) {
-                    int32_t stateTokenIdx = seq0;
-                    if (hasAcceptedTokens_) {
-                        int32_t acceptedTokenNum = numAcceptedTokensGm_.GetValue(batch_i);
-                        if (acceptedTokenNum <= 0 || acceptedTokenNum > seqLen) {
+                    if (hasInitStateIndices_) {
+                        // Draft tree: the host hands over the page each token
+                        // starts from (see spec_decode/tree/state_rollback.py);
+                        // the root token continues the committed prefix.
+                        int32_t initStateIdx = initStateIndicesGm_.GetValue(seq0);
+                        if (initStateIdx < 0) {
                             return;
                         }
-                        stateTokenIdx = seq0 + acceptedTokenNum - 1;
+                        stateOffset = static_cast<uint64_t>(initStateIdx);
+                    } else {
+                        int32_t stateTokenIdx = seq0;
+                        if (hasAcceptedTokens_) {
+                            int32_t acceptedTokenNum = numAcceptedTokensGm_.GetValue(batch_i);
+                            if (acceptedTokenNum <= 0 || acceptedTokenNum > seqLen) {
+                                return;
+                            }
+                            stateTokenIdx = seq0 + acceptedTokenNum - 1;
+                        }
+                        stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
                     }
-                    stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
                     CopyInGamaBeta(seq0, seq1);
                 }
                 ProcessHead(seq0, seq1, head_i, stateOffset);
@@ -264,6 +278,34 @@ private:
             Cast(stateInUb, stateLocal, AscendC::RoundMode::CAST_NONE, alignK_ * curSingleV);
         }
         stateInQueue_.FreeTensor(stateLocal);
+    }
+
+    __aicore__ inline void PrefetchNextStateTile(uint64_t stateOffset, uint64_t head_i, uint64_t v_i,
+                                                uint64_t &nextVOffset, uint32_t &nextSingleV)
+    {
+        nextVOffset = v_i + vStep_;
+        if (nextVOffset < realV_) {
+            nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
+            uint64_t nextStateOffset = ((stateOffset * NV_ + head_i) * realV_ + nextVOffset) * realK_;
+            PrefetchState(nextStateOffset, nextSingleV);
+        }
+    }
+
+    // ``initStateGm_`` and ``finalStateGm_`` are the same pages, so a token that
+    // branches away from the previous token has to wait for that token's state
+    // write (MTE3) before reading the page back (MTE2).
+    __aicore__ inline void SyncStateWriteVisible()
+    {
+        int32_t eventIdMTE3ToMTE2 = static_cast<int32_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+        SetFlag<HardEvent::MTE3_MTE2>(eventIdMTE3ToMTE2);
+        WaitFlag<HardEvent::MTE3_MTE2>(eventIdMTE3ToMTE2);
+    }
+
+    __aicore__ inline void LoadStateTile(uint64_t statePage, uint64_t head_i, uint64_t v_i, uint32_t curSingleV)
+    {
+        uint64_t stateOffset = ((statePage * NV_ + head_i) * realV_ + v_i) * realK_;
+        PrefetchState(stateOffset, curSingleV);
+        LoadPrefetchedState(curSingleV);
     }
 
     __aicore__ inline void MatVecMul(const LocalTensor<float> &cubeTensor, const LocalTensor<float> &vecTensor,
@@ -457,11 +499,10 @@ private:
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
             LoadPrefetchedState(curSingleV);
-            nextVOffset = v_i + vStep_;
-            if (nextVOffset < realV_) {
-                nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
-                nextStateOffset = ((stateOffset * NV_ + head_i) * realV_ + nextVOffset) * realK_;
-                PrefetchState(nextStateOffset, nextSingleV);
+            if (!hasInitStateIndices_) {
+                // Linear chain: overlap fetching the next state tile with the
+                // token loop below.
+                PrefetchNextStateTile(stateOffset, head_i, v_i, nextVOffset, nextSingleV);
             }
             uint64_t pendingAttnOffset = 0;
             uint64_t pendingStateOffset = 0;
@@ -474,6 +515,24 @@ private:
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
                 uint64_t curStateOutOffset =
                     ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
+                if (hasInitStateIndices_ && seq_i > seq0) {
+                    // stateInUb holds the state the previous token wrote, which is
+                    // exactly this node's initial state when it continues that
+                    // token (linear chunk rows and the accepted chain). Only a
+                    // different parent page has to be fetched again.
+                    int32_t parentStateIdx = initStateIndicesGm_.GetValue(seq_i);
+                    if (parentStateIdx < 0) {
+                        return;
+                    }
+                    if (parentStateIdx != ssmStateIndicesGm_.GetValue(seq_i - 1)) {
+                        if (hasPendingState) {
+                            CopyOutState(pendingStateOffset, curSingleV);
+                            hasPendingState = false;
+                        }
+                        SyncStateWriteVisible();
+                        LoadStateTile(static_cast<uint64_t>(parentStateIdx), head_i, v_i, curSingleV);
+                    }
+                }
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
@@ -501,6 +560,11 @@ private:
             }
             if (hasPendingState) {
                 CopyOutState(pendingStateOffset, curSingleV);
+            }
+            if (hasInitStateIndices_) {
+                // Draft tree: the per-token reload inside the loop reuses
+                // stateInQueue_, so the next tile is fetched after the loop.
+                PrefetchNextStateTile(stateOffset, head_i, v_i, nextVOffset, nextSingleV);
             }
         }
         if (hasGamaK_) {
@@ -530,6 +594,7 @@ private:
     GlobalTensor<int32_t> cuSeqlensGm_;
     GlobalTensor<int32_t> ssmStateIndicesGm_;
     GlobalTensor<int32_t> numAcceptedTokensGm_;
+    GlobalTensor<int32_t> initStateIndicesGm_;
     GlobalTensor<stateType> finalStateGm_;
     GlobalTensor<outType> attnOutGm_;
     TPipe *pipe_;
@@ -569,6 +634,7 @@ private:
     uint32_t usedblk;
     uint32_t avgload;
     bool hasAcceptedTokens_;
+    bool hasInitStateIndices_;
     bool hasGama_;
     bool hasGamaK_;
     bool useAddFoldReduce_;

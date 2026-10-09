@@ -63,6 +63,11 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+from vllm_ascend.worker.v2.mamba_mem_stats import (
+    configure_mamba_mem_stats,
+    mamba_state_groups,
+    record_mamba_step,
+)
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_utils import (
     bypass_upstream_spec_pp_guard,
@@ -278,6 +283,14 @@ class NPUModelRunner(GPUModelRunner):
             self.speculator.tree_kv_compact = self.tree_kv_compact
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        # State-cache accounting is only meaningful when the KV cache really has
+        # Mamba/GDN state groups; configure it before the allocation runs.
+        mamba_mem_stats_config = self.ascend_config.mamba_mem_stats_config
+        configure_mamba_mem_stats(
+            enabled=mamba_mem_stats_config.enabled,
+            sample_interval=mamba_mem_stats_config.sample_interval,
+            mamba_groups=mamba_state_groups(kv_cache_config),
+        )
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
             if self.pcp_manager is not None:
@@ -640,6 +653,10 @@ class NPUModelRunner(GPUModelRunner):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        # How many Mamba state pages live requests really hold; sampled, and a
+        # no-op unless additional_config.mamba_mem_stats_config enabled it on a
+        # model that really has GDN/Mamba state (see mamba_mem_stats).
+        record_mamba_step(block_tables, input_batch.num_reqs)
         slot_pos = getattr(input_batch, "slot_positions", None)
         positions = slot_pos if slot_pos is not None else input_batch.positions
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -765,6 +782,8 @@ class NPUModelRunner(GPUModelRunner):
         """
         sampler = getattr(self, "rejection_sampler", None)
         path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
+        if path_node_ids is not None:
+            self._stage_tree_state_resume_column(path_node_ids, num_sampled, num_rejected)
         if path_node_ids is not None and self.tree_kv_compact is not None:
             from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
@@ -783,6 +802,40 @@ class NPUModelRunner(GPUModelRunner):
         # Without MTP, update_requests writes the shared NumPy/torch CPU state.
         if self.speculator is not None:
             self._copy_num_computed_tokens_to_cpu()
+
+    def _stage_tree_state_resume_column(
+        self,
+        path_node_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        """Hand the last accepted tree node to the GDN state commit.
+
+        ``model_state.postprocess_state`` (called inside
+        ``super().postprocess_sampled``) records ``max(num_sampled, 1)`` as the
+        state slot the next step resumes from, which assumes the accepted tokens
+        are a prefix of the verified chain. Under a draft tree they are a
+        root-to-leaf path instead, so the slot has to be the last accepted node
+        (see ``compute_tree_resume_column``). The accepted path itself is staged
+        too: the short conv rebuilds its committed history from those nodes.
+        ``num_sampled``/``idx_mapping`` are in batch order, exactly like the
+        paths produced by the tree sampler, and ``num_rejected`` tells which of
+        those rows the tree op actually verified (see ``tree_row_mask``).
+        """
+        model_state = self.model_state
+        if not hasattr(model_state, "stage_tree_resume_column"):
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            compute_tree_resume_column,
+            tree_row_mask,
+        )
+
+        model_state.stage_tree_resume_column(
+            compute_tree_resume_column(path_node_ids, num_sampled),
+            path_node_ids,
+            num_sampled,
+            is_tree_row=tree_row_mask(num_sampled, num_rejected),
+        )
 
     def _copy_num_computed_tokens_to_cpu(self):
         # npu attention backend still need to use seq_lens_cpu,

@@ -28,6 +28,7 @@ extern "C" {
  * @param [in] g: 数据类型支持：float32。
  * @param [in] gk: 数据类型支持：float32。
  * @param [in] numAcceptedTokens: 数据类型支持：int32。
+ * @param [in] initStateIndices: 数据类型支持：int32。
  * @param [in] scaleValue: 数据类型支持：float32。
  * @param [out] out: 数据类型支持：bfloat16。
  * @param [out] 返回需要在npu device侧申请的workspace大小。
@@ -37,8 +38,8 @@ extern "C" {
 __attribute__((visibility("default"))) aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
     const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta, aclTensor *stateRef,
     const aclTensor *actualSeqLengths, const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
-    const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *out, uint64_t *workspaceSize,
-    aclOpExecutor **executor);
+    const aclTensor *numAcceptedTokens, const aclTensor *initStateIndices, float scaleValue, aclTensor *out,
+    uint64_t *workspaceSize, aclOpExecutor **executor);
 
 /**
  * @brief 

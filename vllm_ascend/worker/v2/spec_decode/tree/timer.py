@@ -31,6 +31,8 @@ _SAMPLES: dict[str, list[float]] = defaultdict(list)
 _ACCUM: dict[str, float] = defaultdict(float)
 _META: dict[str, object] = {}
 _REGISTERED = False
+_STAT_COUNT: dict[str, int] = defaultdict(int)
+_STAT_SUM: dict[str, float] = defaultdict(float)
 
 
 def configure_tree_timer(
@@ -69,6 +71,21 @@ def tree_timer_begin_step() -> None:
     _STEP += 1
     _RECORDING = _STEP > _WARMUP_STEPS
     _ACCUM.clear()
+
+
+def tree_stat(name: str, value: float = 1.0) -> None:
+    """Count one shape observation for the exit report.
+
+    The report prints ``sum`` and ``mean`` per name, so a boolean observation
+    counts how often it held and a per-step count averages over the steps. Free
+    when the timer is disabled -- but the *caller* has to keep any device
+    synchronization (``.item()``, ``bool(...)``) behind
+    :func:`tree_timer_enabled`, because the early return here cannot undo it.
+    """
+    if not _ENABLED:
+        return
+    _STAT_COUNT[name] += 1
+    _STAT_SUM[name] += float(value)
 
 
 def _sync() -> None:
@@ -150,5 +167,14 @@ def print_tree_timer_report() -> None:
         )
     if not any_data:
         lines.append("  (no samples after warmup)")
+    if _STAT_COUNT:
+        # Shape counters: what the draft tree really looked like. A tree that
+        # collapsed to a chain, or whose layout no longer matches the tokens the
+        # scheduler put in the batch, is invisible in the timings above.
+        lines.append("-- shape counters (sum=total, mean=per step) --")
+        for name in sorted(_STAT_COUNT):
+            n = _STAT_COUNT[name]
+            total = _STAT_SUM[name]
+            lines.append(f"  {name}: n={n} sum={total:g} mean={total / n:.3f}")
     lines.append("===========================================")
     print("\n".join(lines), flush=True)

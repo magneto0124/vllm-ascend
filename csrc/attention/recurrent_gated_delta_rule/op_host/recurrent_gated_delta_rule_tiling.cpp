@@ -36,6 +36,7 @@ const size_t SSM_STATE_INDICES_INDEX = 6;
 const size_t G_INDEX = 7;
 const size_t GK_INDEX = 8;
 const size_t ACC_TO_INDEX = 9;
+const size_t INIT_STATE_INDEX = 10;
 
 const size_t QKV_DIM_NUM = 3;
 const size_t BETA_DIM_NUM = 2;
@@ -225,6 +226,13 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::AnalyzeDtype()
         auto numAcceptedTokensDtype = context_->GetOptionalInputDesc(ACC_TO_INDEX)->GetDataType();
         OP_CHECK_IF(numAcceptedTokensDtype != ge::DT_INT32,
                     OP_LOGE(context_->GetNodeName(), "numAcceptedTokens dtype should be int32"),
+                    return ge::GRAPH_FAILED);
+    }
+
+    if (context_->GetOptionalInputDesc(INIT_STATE_INDEX) != nullptr) {
+        auto initStateIndicesDtype = context_->GetOptionalInputDesc(INIT_STATE_INDEX)->GetDataType();
+        OP_CHECK_IF(initStateIndicesDtype != ge::DT_INT32,
+                    OP_LOGE(context_->GetNodeName(), "initStateIndices dtype should be int32"),
                     return ge::GRAPH_FAILED);
     }
 
@@ -455,6 +463,11 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::AnalyzeFormat()
         OP_CHECK_IF(numAcceptedTokensFormat == ge::FORMAT_FRACTAL_NZ,
                     OP_LOGE(context_->GetNodeName(), "numAcceptedTokens format not support NZ"), return ge::GRAPH_FAILED);
     }
+    if (context_->GetOptionalInputDesc(INIT_STATE_INDEX) != nullptr) {
+        auto initStateIndicesFormat = context_->GetOptionalInputDesc(INIT_STATE_INDEX)->GetStorageFormat();
+        OP_CHECK_IF(initStateIndicesFormat == ge::FORMAT_FRACTAL_NZ,
+                    OP_LOGE(context_->GetNodeName(), "initStateIndices format not support NZ"), return ge::GRAPH_FAILED);
+    }
 
     return ge::GRAPH_SUCCESS;
 }
@@ -485,6 +498,19 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetOptionalInput()
     } else {
         tilingData_.hasAcceptedTokens = 1;
     }
+    if (context_->GetOptionalInputDesc(INIT_STATE_INDEX) == nullptr) {
+        tilingData_.hasInitStateIndices = 0;
+    } else {
+        tilingData_.hasInitStateIndices = 1;
+        auto initStateIndicesShape = context_->GetOptionalInputShape(INIT_STATE_INDEX);
+        auto ssmStateIndicesShape = context_->GetInputShape(SSM_STATE_INDICES_INDEX);
+        OP_CHECK_IF(initStateIndicesShape == nullptr || ssmStateIndicesShape == nullptr ||
+                        initStateIndicesShape->GetStorageShape().GetShapeSize() !=
+                            ssmStateIndicesShape->GetStorageShape().GetShapeSize(),
+                    OP_LOGE(context_->GetNodeName(),
+                            "init_state_indices must have the same number of elements as ssm_state_indices"),
+                    return ge::GRAPH_FAILED);
+    }
 
     return ge::GRAPH_SUCCESS;
 }
@@ -508,6 +534,7 @@ void RecurrentGatedDeltaRuleTiling::PrintTilingData()
     OP_LOGD(context_->GetNodeName(), "hasGama: [%u]", tilingData_.hasGama);
     OP_LOGD(context_->GetNodeName(), "hasGamaK: [%u]", tilingData_.hasGamaK);
     OP_LOGD(context_->GetNodeName(), "hasAcceptedTokens: [%u]", tilingData_.hasAcceptedTokens);
+    OP_LOGD(context_->GetNodeName(), "hasInitStateIndices: [%u]", tilingData_.hasInitStateIndices);
 }
 
 int64_t RecurrentGatedDeltaRuleTiling::CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const

@@ -425,6 +425,10 @@ class AscendConfig:
                 "enable_triton": true,
                 "params": {}
             },
+            "mamba_mem_stats_config": {
+                "enabled": false,
+                "sample_interval": 50
+            },
             "sparse_kv_offload_config": {
                 "enabled": false,
                 "topk_buffer_size": 4096,
@@ -512,6 +516,7 @@ class AscendConfig:
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
     tree_spec_config: TreeSpecConfig = dataclasses.field(default_factory=lambda: TreeSpecConfig())
+    mamba_mem_stats_config: MambaMemStatsConfig = dataclasses.field(default_factory=lambda: MambaMemStatsConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1073,6 +1078,14 @@ class TreeSpecConfig:
     ``rejection_sampler`` selects tree verify: ``greedy`` (token-id match) or
     ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
 
+    ``gdn_state_update`` selects how the linear-attention (GDN) state follows the
+    draft tree. Only ``"snapshot"`` is implemented so far: it caches one
+    recurrent state per tree node, so a rejected sibling is dropped by an index
+    change instead of a state copy. The key is read, and validated, only when the
+    model really uses GDN state (see
+    ``worker.v2.spec_decode.tree.state_rollback.GDN_STATE_UPDATE_METHODS``), so on
+    any other model it has no effect and an unrecognized value is not reported.
+
     ``enable_triton`` (default True) runs tree hot-path Triton kernels when
     Triton is available; set False to force torch fallbacks.
 
@@ -1105,6 +1118,10 @@ class TreeSpecConfig:
     budget: int | None = None
     topk: int | None = None
     rejection_sampler: str = "greedy"
+    # GDN-only: how the linear-attention state follows the draft tree. Read on
+    # the GDN path only, so it is inert for every other state backend (the
+    # registry lives in worker.v2.spec_decode.tree.state_rollback).
+    gdn_state_update: str = "snapshot"
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
     # When true, print segment timings at process exit.
     enable_timer: bool = False
@@ -1168,6 +1185,49 @@ class TreeSpecConfig:
             "dspark" if speculative_config.use_dspark() else "dflash"
         )
         validate_tree_method_backend(self.method, draft_backend)
+
+
+@config
+class MambaMemStatsConfig:
+    """Mamba/GDN state-cache accounting from ``additional_config.mamba_mem_stats_config``.
+
+    When ``enabled``, the worker measures the state cache off the objects it
+    really allocated instead of re-deriving it from config, and prints one report
+    at process exit: the state buffers with their conv / ssm / padding split, the
+    pool block count, the device-memory delta of the KV allocation, and -- sampled
+    every ``sample_interval`` steps -- how many state pages the live requests
+    really hold.
+
+    The collector is inert unless the model really runs Mamba/GDN state layers:
+    with no Mamba group in the KV cache there is nothing to record, no report is
+    printed, and enabling the option has no effect on any other model. Chain MTP
+    and draft-tree verify go through the same code, so the two can be compared
+    directly.
+
+    Usage::
+
+        llm = LLM(
+            model,
+            additional_config={
+                "mamba_mem_stats_config": {
+                    "enabled": True,
+                    "sample_interval": 50,
+                }
+            },
+        )
+    """
+
+    enabled: bool = False
+    # Steps between two block-table samples. Reading a block table back to the
+    # host synchronizes the device, so only one step out of N is sampled; the
+    # first step is always sampled, so a short run still reports.
+    sample_interval: int = 50
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.sample_interval < 1:
+            raise ValueError(f"mamba_mem_stats_config.sample_interval must be >= 1, got {self.sample_interval}")
+        return self
 
 
 @config
