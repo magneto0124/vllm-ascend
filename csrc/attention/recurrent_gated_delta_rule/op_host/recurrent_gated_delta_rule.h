@@ -17,7 +17,8 @@ namespace l0op {
 const aclTensor *RecurrentGatedDeltaRule(const aclTensor *query, const aclTensor *key, const aclTensor *value,
                                          const aclTensor *beta, aclTensor *stateRef, const aclTensor *actualSeqLengths,
                                          const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
-                                         const aclTensor *numAcceptedTokens, float scaleValue, aclOpExecutor *executor);
+                                         const aclTensor *numAcceptedTokens, const aclTensor *initStateIndices,
+                                         float scaleValue, aclOpExecutor *executor);
 }
 
 #endif // PTA_NPU_OP_API_COMMON_INC_LEVEL0_OP_RECURRENT_GETED_DELTA_RULE

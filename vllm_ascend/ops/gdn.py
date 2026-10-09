@@ -21,7 +21,7 @@ from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator, is_conv_state_dim_first
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # type: ignore
@@ -39,6 +39,111 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+
+
+def tree_causal_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    window_rows: torch.Tensor,
+    prefix_src: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool,
+) -> torch.Tensor:
+    """Causal short conv of a draft-tree verify batch.
+
+    ``npu_causal_conv1d_custom`` slides a single window along the batch order,
+    i.e. over the parent/child order of a linear chain. A draft tree verifies a
+    whole tree per request, so every node has to convolve over its *own*
+    root-to-node ancestors instead; ``window_rows`` (``[T, width]``) gathers
+    them from ``cat([committed history, this step's activations])``, see
+    ``spec_decode/tree/state_rollback.compute_tree_conv_rows``.
+
+    The committed history is the state page's first ``width - 1`` columns. It is
+    re-anchored here, before it is read: ``prefix_src`` (``[R, width - 1]``
+    conv-state columns, see ``compute_tree_prefix_source``) points at the
+    ``width - 1`` activations ending at the node the sampler accepted last step,
+    which live in the page's node columns (columns ``width - 1 + node id``, the
+    activations this op stored while verifying the accepted tree) or in the
+    prefix itself once the accepted path is shorter than the window. The page
+    therefore keeps this step's node activations for the next step to pick from,
+    and the prefix columns hold the linear-chain convention -- the last
+    ``width - 1`` activations of the committed path -- at all times.
+
+    Args:
+        x: ``[T, conv_dim]`` activations of the spec batch, request-major with
+            ``1 + budget`` tokens per request.
+        weight: ``[conv_dim, width]`` conv weights, oldest tap first (the layout
+            of ``self.conv1d.weight``, i.e. the transpose of the op's).
+        conv_state: the conv cache, ``[blocks, state_len, conv_dim]`` or
+            ``[blocks, conv_dim, state_len]`` on dim-first layouts; the last
+            ``slots`` columns (``[width - 1 + slots, ...)``) hold the node
+            activations of the previous step.
+        cache_indices: ``[R, slots]`` state pages packed token-major (see
+            ``gdn_attn_builder._pack_tree_rows_to_tokens``); a request's running
+            state block sits at its token start.
+        query_start_loc: ``[R + 1]`` spec batch token offsets; zero-length rows
+            (full-graph padding) are skipped.
+        window_rows: ``[T, width]`` rows of every node's conv taps.
+        prefix_src: ``[R, width - 1]`` columns of the new committed history.
+        bias: optional conv bias.
+        activation: whether to apply the SiLU activation.
+
+    Returns:
+        ``[T, conv_dim]`` conv activations.
+    """
+    width = weight.shape[1]
+    conv_dim = weight.shape[0]
+    starts = query_start_loc.to(torch.long)
+    rows = starts.numel() - 1
+    # ``cache_indices`` is packed token-major, so a request's running state block
+    # is the entry at its token start. Full-graph padding replays with
+    # zero-length rows: they own no state page, so read a harmless one and skip
+    # their state update below. Only real rows contribute tokens, so they are
+    # exactly the rows of ``x``.
+    pages = cache_indices.reshape(-1)[starts[:rows]].to(torch.long).clamp(min=0)
+    valid = torch.diff(starts) > 0
+    page_ids = pages[valid]
+    dim_first = is_conv_state_dim_first()
+
+    # Re-anchor the committed history on the node the sampler accepted last
+    # step, before reading it: the page still holds that step's node
+    # activations in columns [width - 1, width - 1 + slots).
+    state = conv_state[page_ids]
+    columns = prefix_src[valid].to(torch.long)
+    if dim_first:
+        columns = columns.unsqueeze(1).expand(-1, conv_dim, -1)
+        conv_state[page_ids, :, : width - 1] = state.gather(2, columns)
+    else:
+        columns = columns.unsqueeze(-1).expand(-1, -1, conv_dim)
+        conv_state[page_ids, : width - 1, :] = state.gather(1, columns)
+
+    state = conv_state[pages]
+    history = state[:, :, : width - 1].transpose(1, 2) if dim_first else state[:, : width - 1, :]
+    source = torch.cat((history.reshape(-1, conv_dim), x), dim=0)
+    taps = source.index_select(0, window_rows.reshape(-1).to(torch.long)).view(-1, width, conv_dim)
+    out = (taps * weight.transpose(0, 1)).sum(dim=1)
+    if bias is not None:
+        out = out + bias
+    if activation:
+        out = torch.nn.functional.silu(out)
+
+    # Keep this step's node activations for the next step's history: the token at
+    # packed position ``p`` is node ``p - start(row)`` of its request, i.e. column
+    # ``width - 1 + node`` of that request's state page. A row may verify fewer
+    # than ``slots`` tokens; the columns past its nodes keep the previous step's
+    # activations, and no window the next step builds reads them.
+    positions = torch.arange(x.shape[0], device=starts.device)
+    row_of_token = (positions.unsqueeze(1) >= starts[1:].unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
+    token_columns = width - 1 + positions - starts[:rows][row_of_token]
+    token_pages = pages[row_of_token]
+    if dim_first:
+        conv_state[token_pages, :, token_columns] = x
+    else:
+        conv_state[token_pages, token_columns, :] = x
+    return out
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -320,22 +425,39 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation_num = 1 if self.activation else 0
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
-            output_spec = torch.empty_like(mixed_qkv_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
-                output_spec,
-                mixed_qkv_spec,
-                conv_weights_T,
-                conv_state=self_kv_cache[0],
-                bias_opt=self.conv1d.bias,
-                query_start_loc_opt=spec_query_start_loc_device,
-                cache_indices_opt=spec_causal_conv1d_meta.cache_indices,
-                initial_state_mode_opt=None,
-                num_accepted_tokens_opt=spec_causal_conv1d_meta.num_accepted_tokens,
-                activation_mode=activation_num,
-                pad_slot_id=PAD_SLOT_ID,
-                run_mode=1,
-            )
-            mixed_qkv_spec = output_spec
+            if attn_metadata.spec_decode_metadata.conv_window_rows is not None:
+                # Draft tree: every node convolves over its own ancestors.
+                # Linearly ordered rows (siblings, unrelated nodes) never enter a
+                # node's window, which is what the sliding-window op assumes.
+                window_rows = attn_metadata.spec_decode_metadata.conv_window_rows
+                mixed_qkv_spec = tree_causal_conv1d(
+                    mixed_qkv_spec,
+                    conv_weights,
+                    self_kv_cache[0],
+                    spec_causal_conv1d_meta.cache_indices,
+                    spec_query_start_loc_device,
+                    window_rows[: mixed_qkv_spec.shape[0]],
+                    attn_metadata.spec_decode_metadata.conv_prefix_src,
+                    self.conv1d.bias,
+                    activation_num,
+                )
+            else:
+                output_spec = torch.empty_like(mixed_qkv_spec)
+                torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    output_spec,
+                    mixed_qkv_spec,
+                    conv_weights_T,
+                    conv_state=self_kv_cache[0],
+                    bias_opt=self.conv1d.bias,
+                    query_start_loc_opt=spec_query_start_loc_device,
+                    cache_indices_opt=spec_causal_conv1d_meta.cache_indices,
+                    initial_state_mode_opt=None,
+                    num_accepted_tokens_opt=spec_causal_conv1d_meta.num_accepted_tokens,
+                    activation_mode=activation_num,
+                    pad_slot_id=PAD_SLOT_ID,
+                    run_mode=1,
+                )
+                mixed_qkv_spec = output_spec
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -460,12 +582,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+            init_state_indices = attn_metadata.spec_decode_metadata.init_state_indices
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             # The custom op extends dtype support (e.g. float32 state) and is
             # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
+            spec_recurrent_kwargs = {}
+            if init_state_indices is not None:
+                # Draft tree: every node loads its state from its parent's slot
+                # (see spec_decode/tree/state_rollback.py). The op must be built
+                # with the ``init_state_indices`` input.
+                spec_recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
             core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                 query=query_spec.squeeze(0),
                 key=key_spec.squeeze(0),
@@ -477,6 +606,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=spec_state_indices_tensor.flatten(),
                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                **spec_recurrent_kwargs,
             ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None

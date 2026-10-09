@@ -1,6 +1,7 @@
 import logging
 
 import torch
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     iter_unique_kv_cache_tensors,
@@ -90,6 +91,10 @@ class TreeKvCompact:
         groups = []
         seen: set[int] = set()
         for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                # Mamba state pages are addressed by request state slot, not by
+                # token position, so the prefix/node slot move must skip them.
+                continue
             caches: list[torch.Tensor] = []
             gathers: list[torch.Tensor] = []
             for layer_name in group.layer_names:

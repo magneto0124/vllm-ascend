@@ -2857,7 +2857,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? ssm_state_indices=None, "
         "                               Tensor? num_accepted_tokens=None, "
         "                               Tensor? g=None, "
-        "                               Tensor? gk=None) -> Tensor");
+        "                               Tensor? gk=None, "
+        "                               Tensor? init_state_indices=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
 
     ops.def(

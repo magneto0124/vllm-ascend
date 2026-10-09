@@ -765,6 +765,8 @@ class NPUModelRunner(GPUModelRunner):
         """
         sampler = getattr(self, "rejection_sampler", None)
         path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
+        if path_node_ids is not None:
+            self._stage_tree_state_resume_column(path_node_ids, num_sampled)
         if path_node_ids is not None and self.tree_kv_compact is not None:
             from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
@@ -783,6 +785,36 @@ class NPUModelRunner(GPUModelRunner):
         # Without MTP, update_requests writes the shared NumPy/torch CPU state.
         if self.speculator is not None:
             self._copy_num_computed_tokens_to_cpu()
+
+    def _stage_tree_state_resume_column(
+        self,
+        path_node_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> None:
+        """Hand the last accepted tree node to the GDN state commit.
+
+        ``model_state.postprocess_state`` (called inside
+        ``super().postprocess_sampled``) records ``max(num_sampled, 1)`` as the
+        state slot the next step resumes from, which assumes the accepted tokens
+        are a prefix of the verified chain. Under a draft tree they are a
+        root-to-leaf path instead, so the slot has to be the last accepted node
+        (see ``compute_tree_resume_column``). The accepted path itself is staged
+        too: the short conv rebuilds its committed history from those nodes.
+        ``num_sampled``/``idx_mapping`` are in batch order, exactly like the
+        paths produced by the tree sampler.
+        """
+        model_state = self.model_state
+        if not hasattr(model_state, "stage_tree_resume_column"):
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            compute_tree_resume_column,
+        )
+
+        model_state.stage_tree_resume_column(
+            compute_tree_resume_column(path_node_ids, num_sampled),
+            path_node_ids,
+            num_sampled,
+        )
 
     def _copy_num_computed_tokens_to_cpu(self):
         # npu attention backend still need to use seq_lens_cpu,

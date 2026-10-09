@@ -54,6 +54,7 @@ struct RecurrentGatedDeltaRuleParams {
     const aclTensor *g {nullptr};
     const aclTensor *gk {nullptr};
     const aclTensor *num_accepted_tokens {nullptr};
+    const aclTensor *init_state_indices {nullptr};
     // attrs
     float scale {1.0f};
     //output
@@ -106,6 +107,9 @@ static inline bool CheckDtypeVaild(const RecurrentGatedDeltaRuleParams &params)
     if (params.num_accepted_tokens != nullptr) {
         OP_CHECK_DTYPE_NOT_SUPPORT(params.num_accepted_tokens, ACC_TO_TYPE_SUPPORT_LIST, return false);
     }
+    if (params.init_state_indices != nullptr) {
+        OP_CHECK_DTYPE_NOT_SUPPORT(params.init_state_indices, ACC_TO_TYPE_SUPPORT_LIST, return false);
+    }
 
     OP_CHECK_DTYPE_NOT_SUPPORT(params.out, OUT_TYPE_SUPPORT_LIST, return false);
     return true;
@@ -140,18 +144,19 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
                                                          aclTensor *stateRef, const aclTensor *actualSeqLengths,
                                                          const aclTensor *ssmStateIndices, const aclTensor *g,
                                                          const aclTensor *gk, const aclTensor *numAcceptedTokens,
-                                                         float scaleValue, aclTensor *out, uint64_t *workspaceSize,
+                                                         const aclTensor *initStateIndices, float scaleValue,
+                                                         aclTensor *out, uint64_t *workspaceSize,
                                                          aclOpExecutor **executor)
 {
     L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
                    DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
-                          numAcceptedTokens, scaleValue),
+                          numAcceptedTokens, initStateIndices, scaleValue),
                    DFX_OUT(out, stateRef));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
-    RecurrentGatedDeltaRuleParams params {query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,scaleValue, out};
+    RecurrentGatedDeltaRuleParams params {query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens, initStateIndices, scaleValue, out};
 
     CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckParams(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
@@ -173,13 +178,16 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
     if (numAcceptedTokens != nullptr) {
         numAcceptedTokens = l0op::Contiguous(numAcceptedTokens, uniqueExecutor.get());
     }
+    if (initStateIndices != nullptr) {
+        initStateIndices = l0op::Contiguous(initStateIndices, uniqueExecutor.get());
+    }
 
     auto out_ = l0op::Contiguous(out, uniqueExecutor.get());
 
     // 调用l0接口
     auto outRet =
         l0op::RecurrentGatedDeltaRule(query_, key_, value_, beta_, stateRef, actualSeqLengths_, ssmStateIndices_, g, gk,
-                                      numAcceptedTokens, scaleValue, uniqueExecutor.get());
+                                      numAcceptedTokens, initStateIndices, scaleValue, uniqueExecutor.get());
     if (outRet == nullptr) {
         return ACLNN_ERR_INNER_NULLPTR;
     }

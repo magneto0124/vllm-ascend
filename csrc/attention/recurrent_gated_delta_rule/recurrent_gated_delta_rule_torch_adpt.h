@@ -29,7 +29,8 @@ at::Tensor npu_recurrent_gated_delta_rule(
     const c10::optional<at::Tensor>& ssm_state_indices,
     const c10::optional<at::Tensor>& num_accepted_tokens,
     const c10::optional<at::Tensor>& g,
-    const c10::optional<at::Tensor>& gk)
+    const c10::optional<at::Tensor>& gk,
+    const c10::optional<at::Tensor>& init_state_indices)
 {
     TORCH_CHECK(scale.has_value(), "scale cannot be empty.");
 
@@ -47,6 +48,7 @@ at::Tensor npu_recurrent_gated_delta_rule(
                  g,
                  gk,
                  num_accepted_tokens,
+                 init_state_indices,
                  scale_real,
                  output);
     return output;

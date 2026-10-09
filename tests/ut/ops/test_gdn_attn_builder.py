@@ -1064,3 +1064,171 @@ def test_full_graph_non_spec_metadata_nulls_padded_state_indices(
         decode_metadata.actual_seq_lengths,
         torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32),
     )
+
+
+def _make_tree_builder(slots: int = 4):
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=slots - 1,
+    )
+    builder.spec_tree_slots = slots
+    return builder
+
+
+def test_tree_init_state_indices_point_at_parent_slots():
+    """Every draft-tree node loads the state of its own parent slot."""
+    builder = _make_tree_builder()
+    state_indices = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
+    )
+    # Row 0 resumes from the root slot, row 1 from the slot of node 2.
+    num_accepted_tokens = torch.tensor([1, 3], dtype=torch.int32)
+    query_lens_cpu = torch.tensor([4, 4])
+    spec_sequence_masks_cpu = torch.tensor([True, True])
+    # Node 2 of row 0 branches off the root instead of node 1.
+    tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.long)
+    tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+
+    init_state_indices = builder._build_tree_init_state_indices(
+        state_indices,
+        num_accepted_tokens,
+        query_lens_cpu,
+        spec_sequence_masks_cpu,
+        tree_parents,
+        tree_num_nodes,
+        torch.tensor([0, 1]),
+    )
+
+    assert init_state_indices is not None
+    assert init_state_indices.tolist() == [[10, 10, 10, 11], [22, 20, 21, 22]]
+
+
+def test_tree_init_state_indices_none_without_tree_layout():
+    """The linear MTP chain keeps the recurrent kernel's in-register carry."""
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+    )
+
+    assert (
+        builder._build_tree_init_state_indices(
+            torch.zeros((1, 4), dtype=torch.int32),
+            torch.ones((1,), dtype=torch.int32),
+            torch.tensor([4]),
+            torch.tensor([True]),
+            None,
+            None,
+            torch.tensor([0]),
+        )
+        is None
+    )
+
+
+def test_tree_init_state_indices_pack_short_rows_token_major():
+    """A row may verify fewer tokens than the draft-tree width."""
+    builder = _make_tree_builder()
+    state_indices = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32)
+    # Row 0 verifies two tokens (the tree search ran out of candidates, or the
+    # scheduler truncated its draft near max_model_len), row 1 the whole tree.
+    # The kernel reads the page table by global token offset, so the rows are
+    # packed back to back.
+    query_lens_cpu = torch.tensor([2, 4])
+    spec_sequence_masks_cpu = torch.tensor([True, True])
+    tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.long)
+    tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+
+    init_state_indices = builder._build_tree_init_state_indices(
+        state_indices,
+        num_accepted_tokens,
+        query_lens_cpu,
+        spec_sequence_masks_cpu,
+        tree_parents,
+        tree_num_nodes,
+        torch.tensor([0, 1]),
+    )
+
+    assert init_state_indices is not None
+    assert init_state_indices.shape == (2, 4)
+    assert init_state_indices.flatten()[:6].tolist() == [10, 10, 20, 20, 21, 22]
+    assert torch.all(init_state_indices.flatten()[6:] == NULL_BLOCK_ID)
+
+
+def test_tree_init_state_indices_reject_a_width_beyond_the_tree():
+    """No row can verify more tokens than the state layout carries."""
+    builder = _make_tree_builder()
+
+    with pytest.raises(ValueError, match="verified tokens"):
+        builder._build_tree_init_state_indices(
+            torch.zeros((2, 4), dtype=torch.int32),
+            torch.ones((2,), dtype=torch.int32),
+            torch.tensor([4, 5]),
+            torch.tensor([True, True]),
+            torch.zeros((2, 3), dtype=torch.long),
+            torch.zeros((2,), dtype=torch.int32),
+            torch.tensor([0, 1]),
+        )
+
+
+def test_pack_tree_rows_to_tokens_leaves_full_rows_alone():
+    """A batch where every row verifies the full width keeps the old layout."""
+    table = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+
+    packed = ascend_gdn_attn_builder._pack_tree_rows_to_tokens(
+        table,
+        torch.tensor([4, 4, 4]),
+        4,
+    )
+
+    assert torch.equal(packed, table)
+
+
+def test_tree_conv_rows_follow_the_tree_layout():
+    """The conv tap tables are sized by the spec batch and the state width."""
+    builder = _make_tree_builder()
+    builder.spec_conv_width = 4
+    builder.spec_conv_window_rows = torch.empty((16, 4), dtype=torch.int32)
+    builder.spec_conv_prefix_src = torch.empty((16, 3), dtype=torch.int32)
+    tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.long)
+    tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+    # Accepted path of the previous step in the samplers' layout: entry ``k`` is
+    # the accept-walk node of depth ``k + 1`` (the root is node 0, so it never
+    # shows up) and ``-1`` an unused slot. Row 0 accepted no draft node, row 1
+    # the whole chain 0 -> 1 -> 2.
+    prev_path_node_ids = torch.tensor([[-1, -1, -1], [1, 2, -1]], dtype=torch.int32)
+    prev_num_sampled = torch.tensor([1, 3], dtype=torch.int32)
+
+    window_rows, prefix_src = builder._build_tree_conv_rows(
+        # The resume cursor of the previous step, as compute_tree_resume_column
+        # derives it from the path above: the state after the root (row 0) and
+        # after node 2 (row 1).
+        torch.tensor([1, 3], dtype=torch.int32),
+        tree_parents,
+        tree_num_nodes,
+        torch.tensor([0, 1]),
+        prev_path_node_ids,
+        prev_num_sampled,
+    )
+
+    assert window_rows is not None and window_rows.shape == (2 * 4, 4)
+    assert prefix_src is not None and prefix_src.shape == (2, 3)
+    # Row 0 accepted the root only, so its history is the two committed columns
+    # before the root plus the root's own node column (node_offset == rows *
+    # (width-1) == 6 -> column 3 + 0).
+    assert prefix_src[0].tolist() == [1, 2, 3]
+    # Row 1 accepted the whole chain 0 -> 1 -> 2, i.e. node columns 3, 4 and 5.
+    assert prefix_src[1].tolist() == [3, 4, 5]
+
+
+def test_tree_conv_rows_none_without_tree_buffers():
+    """A builder that never sized tree buffers keeps the chain conv op."""
+    builder = _make_builder(device=torch.device("cpu"), num_heads=32, num_speculative_tokens=3)
+
+    assert builder._build_tree_conv_rows(
+        torch.ones((1,), dtype=torch.int32),
+        torch.zeros((1, 3), dtype=torch.long),
+        torch.zeros((1,), dtype=torch.int32),
+        torch.tensor([0]),
+    ) == (None, None)
