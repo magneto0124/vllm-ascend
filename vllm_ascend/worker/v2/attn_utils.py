@@ -80,48 +80,51 @@ if TYPE_CHECKING:
 def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
     """Size a Mamba state spec for the ``tree_spec_config`` draft tree.
 
-    ``MambaBase.get_kv_cache_spec`` derives ``num_speculative_blocks`` (how many
-    recurrent state pages are kept per request) from ``num_speculative_tokens``,
-    which describes a linear draft chain. A draft tree verifies ``1 + budget``
-    nodes and every node keeps its own state slot, so the page count has to
-    follow the tree width instead.
+    ``MambaBase.get_kv_cache_spec`` derives ``num_speculative_blocks`` from
+    ``num_speculative_tokens``, which describes a linear draft chain. A draft
+    tree's recurrent page count depends on the selected update method: snapshot
+    keeps one page per node, while TreeWY needs one committed page.
 
-    The short-conv state also grows: the tree conv keeps the activations of all
-    ``1 + budget`` nodes of the step in the page (columns
-    ``width - 1 .. width - 1 + slots``) so the next step can rebuild the
-    committed history from whichever node the sampler accepted (see
-    ``ops/gdn.tree_causal_conv1d``). Every GDN layer gets the same width, which
-    keeps the mamba layers inside one uniform KV cache group.
+    The short-conv state is sized independently. It keeps all ``1 + budget``
+    node activations in the page (columns ``width - 1 .. width - 1 + slots``)
+    so the next step can rebuild committed history from whichever node the
+    sampler accepted (see ``ops/gdn.tree_causal_conv1d``). Every GDN layer gets
+    the same width, which keeps the mamba layers inside one uniform KV cache group.
     """
     from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+        tree_conv_slot_count,
         tree_conv_width,
-        tree_state_slot_count,
+        tree_recurrent_state_slot_count,
+        tree_verify_slot_count,
         validate_tree_state_slots,
     )
 
-    slots = tree_state_slot_count(vllm_config)
-    if slots is None:
+    verify_slots = tree_verify_slot_count(vllm_config)
+    if verify_slots is None:
         return spec
-    validate_tree_state_slots(slots, spec.mamba_type)
+    validate_tree_state_slots(verify_slots, spec.mamba_type)
+    recurrent_slots = tree_recurrent_state_slot_count(vllm_config)
+    conv_slots = tree_conv_slot_count(vllm_config)
+    assert recurrent_slots is not None and conv_slots is not None
 
     num_spec = vllm_config.speculative_config.num_speculative_tokens
-    if slots > spec.num_speculative_blocks + 1:
-        # One recurrent state page per tree node.
-        spec = replace(spec, num_speculative_blocks=slots - 1)
+    if recurrent_slots != spec.num_speculative_blocks + 1:
+        # Snapshot keeps one recurrent state page per tree node. TreeWY only
+        # needs the committed page; its accepted state is rebuilt after sample.
+        spec = replace(spec, num_speculative_blocks=recurrent_slots - 1)
 
     conv_state_shape = spec.shapes[0]
     width = tree_conv_width(spec.mamba_type, tuple(conv_state_shape), num_spec)
-    # The tree verifies ``slots`` tokens per request, i.e. the page holds one
-    # conv-state column per node; a tree no wider than the draft chain needs no
-    # extra column, but it still needs them the moment it is one node wider.
-    extra_columns = slots - num_spec
+    # The conv cache keeps one activation per verified node, independently of
+    # how many recurrent snapshots the selected state update method stores.
+    extra_columns = conv_slots - num_spec
     if width is None or extra_columns <= 0:
         return spec
     # The conv dimension is the larger side; the extra node columns widen the
     # page by exactly their bytes. ``shapes`` and ``dtypes`` are positional, so
     # entry 0 is the conv state this branch widens.
     conv_dim = max(conv_state_shape)
-    expected_columns = width - 1 + slots
+    expected_columns = width - 1 + conv_slots
     conv_state_shape = (
         (conv_dim, expected_columns) if is_conv_state_dim_first() else (expected_columns, conv_dim)
     )

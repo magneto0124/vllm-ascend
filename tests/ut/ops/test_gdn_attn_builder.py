@@ -35,6 +35,26 @@ from vllm_ascend.ops.triton.fla.utils import (
 from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     GDN_RECURRENT_MAX_VERIFY_TOKENS,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.treewy import treewy_ancestor_mask
+
+
+def test_treewy_builder_refreshes_stable_ancestor_buffer_between_batches():
+    builder = object.__new__(AscendGDNAttentionMetadataBuilder)
+    builder.spec_tree_slots = 4
+    builder.spec_tree_parents = torch.empty((2, 3), dtype=torch.int32)
+    builder.spec_tree_num_nodes = torch.empty(2, dtype=torch.int32)
+    builder.spec_tree_ancestors = torch.empty((2, 4, 4), dtype=torch.bool)
+    sequence_indices = torch.arange(2)
+    node_counts = torch.tensor([3, 0], dtype=torch.int32)
+    chain_parents = torch.tensor([[0, 1, 2], [0, 0, 0]], dtype=torch.int32)
+    first_parents, first_counts = builder._select_tree_layout(chain_parents, node_counts, sequence_indices)
+    first_mask = builder.spec_tree_ancestors[:2].clone()
+    torch.testing.assert_close(first_mask, treewy_ancestor_mask(first_parents, first_counts))
+
+    branch_parents = torch.tensor([[0, 0, 0], [0, 0, 0]], dtype=torch.int32)
+    second_parents, second_counts = builder._select_tree_layout(branch_parents, node_counts, sequence_indices)
+    assert not torch.equal(first_mask, builder.spec_tree_ancestors[:2])
+    torch.testing.assert_close(builder.spec_tree_ancestors[:2], treewy_ancestor_mask(second_parents, second_counts))
 
 
 @pytest.fixture(autouse=True)
@@ -907,6 +927,31 @@ def test_spec_width_prompt_chunk_folds_only_without_dcp(
     else:
         assert metadata.spec_sequence_masks is None
         assert metadata.num_accepted_tokens is None
+
+
+@pytest.mark.parametrize("method", ["treewy", "snapshot"])
+@pytest.mark.parametrize("mixed_spec", [False, True])
+def test_treewy_does_not_fold_prompt_chunks_into_sampler_committed_state(monkeypatch, method, mixed_spec):
+    builder = _make_tree_builder(slots=4)
+    monkeypatch.setattr(ascend_gdn_attn_builder, "selected_gdn_state_update_name", lambda: method)
+    common = SimpleNamespace(
+        is_prefilling=torch.tensor([False, True] if mixed_spec else [True]),
+        seq_lens_cpu_upper_bound=torch.tensor([104, 204] if mixed_spec else [204]),
+        query_start_loc_cpu=torch.tensor([0, 4, 8] if mixed_spec else [0, 4]),
+    )
+    masks = torch.tensor([True, False] if mixed_spec else [False])
+    accepted = torch.tensor([2, 1] if mixed_spec else [1], dtype=torch.int32)
+    result_masks, result_accepted = builder._fold_spec_sized_prefill_chunks_into_spec(common, masks, accepted)
+    assert masks.tolist() == ([True, False] if mixed_spec else [False])
+    assert accepted.tolist() == ([2, 1] if mixed_spec else [1])
+    if method == "treewy":
+        # The final prompt chunk samples one token but has four real inputs;
+        # it must stay in prefill, not commit the root of a speculative chain.
+        assert result_masks.tolist() == masks.tolist()
+        assert result_accepted.tolist() == accepted.tolist()
+    else:
+        assert result_masks.tolist() == ([True, True] if mixed_spec else [True])
+        assert result_accepted.tolist() == ([2, 4] if mixed_spec else [4])
 
 
 def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():

@@ -104,9 +104,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     base so cooperative ``super()`` calls retain the Ascend model-state MRO.
     """
 
-    # GDN state slot the next step has to resume from, staged by the model
-    # runner while verifying a draft tree (see ``tree.state_rollback``); ``None``
-    # means the linear-chain convention (``num_sampled``) applies.
+    # GDN state cursor staged by the model runner while verifying a draft tree
+    # (see ``tree.state_rollback``). TreeWY normalizes it to its single page.
     _tree_resume_column: torch.Tensor | None = None
     # Accepted draft path of the step being committed, in batch order, plus its
     # sampled token count; kept per request so the next step can re-anchor the
@@ -139,7 +138,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         num_sampled: torch.Tensor | None = None,
         is_tree_row: torch.Tensor | None = None,
     ) -> None:
-        """Record the state slot committed at the end of the current step."""
+        """Stage the accepted path and the recurrent-state resume cursor."""
         self._tree_resume_column = resume_column
         self._tree_path = path_node_ids
         self._tree_num_sampled = num_sampled
@@ -157,10 +156,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         """
         # Imported here to keep the model state import graph flat.
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
-            tree_state_slot_count,
+            tree_verify_slot_count,
         )
 
-        slots = tree_state_slot_count(self.vllm_config)
+        slots = tree_verify_slot_count(self.vllm_config)
         assert slots is not None, "draft-tree buffers need an active tree_spec_config"
         path_width = slots - 1
         # Per-request storage: ``idx_mapping`` values address the request slots
@@ -174,17 +173,84 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         assert self._tree_prev_num_sampled is not None
         return path, self._tree_prev_num_sampled
 
+    def _bind_treewy_contexts(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        num_reqs: int,
+        num_tokens: int,
+        for_capture: bool,
+    ) -> None:
+        """Keep graph-captured TreeWY intermediates reachable for state commit.
+
+        GDN verification runs inside the captured graph, while sampling and
+        recurrent-state commit run afterward in Python. The context dictionary
+        populated during capture must therefore be shared by metadata built for
+        later replays of the same graph shape. Eager execution keeps its
+        per-forward context dictionary and does not replace captured entries.
+        """
+        graph_kind = None
+        if for_capture:
+            graph_kind = "full"
+        elif cudagraph_mode.name.startswith("FULL"):
+            graph_kind = "full"
+        elif cudagraph_mode.name == "PIECEWISE":
+            graph_kind = "piecewise"
+
+        graph_contexts = None
+        if graph_kind is not None:
+            registry = getattr(self, "_treewy_graph_contexts", None)
+            if registry is None:
+                registry = {}
+                self._treewy_graph_contexts = registry
+            key = (graph_kind, num_reqs, num_tokens)
+            graph_contexts = registry.setdefault(key, {})
+            if for_capture:
+                # A graph can be recaptured after a failed or invalidated
+                # capture. Drop references to the old static outputs first.
+                graph_contexts.clear()
+
+        contexts_to_commit = []
+        seen_metadata = set()
+        for metadata in self.attn_metadata.values():
+            if id(metadata) in seen_metadata:
+                continue
+            seen_metadata.add(id(metadata))
+            spec_metadata = getattr(metadata, "spec_decode_metadata", None)
+            if getattr(spec_metadata, "gdn_state_update_method", None) != "treewy":
+                continue
+            if graph_contexts is not None:
+                spec_metadata.treewy_contexts = graph_contexts
+                contexts = graph_contexts
+            else:
+                contexts = spec_metadata.treewy_contexts
+            if contexts is not None and all(contexts is not existing for existing in contexts_to_commit):
+                contexts_to_commit.append(contexts)
+        self._treewy_contexts_to_commit = contexts_to_commit
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
-        # Under a draft tree the accepted tokens are a root-to-leaf path instead
-        # of a prefix, so the state to resume from is the last accepted node and
-        # not ``num_sampled``. It feeds the same scatter as the chain path (state
-        # index for the next step, cross-block state copy bias and the align
-        # postprocess), so only the value changes.
+        contexts_to_commit = getattr(self, "_treewy_contexts_to_commit", None)
+        if self._tree_path is not None and self._tree_num_sampled is not None and contexts_to_commit:
+            from vllm_ascend.worker.v2.spec_decode.tree.treewy import (
+                treewy_commit_contexts_torch,
+            )
+
+            for contexts in contexts_to_commit:
+                if contexts:
+                    treewy_commit_contexts_torch(
+                        contexts,
+                        self._tree_path,
+                        self._tree_num_sampled,
+                    )
+        self._treewy_contexts_to_commit = []
+
+        # Snapshot state pages follow the accepted root-to-leaf path, so their
+        # resume cursor is the last accepted node. TreeWY reconstructs that
+        # node into its sole recurrent page and normalizes the cursor below.
         if self._tree_resume_column is not None:
             num_sampled = self._tree_resume_column
             self._tree_resume_column = None
@@ -230,6 +296,14 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             self._tree_path = None
             self._tree_num_sampled = None
             self._tree_is_tree_row = None
+        if getattr(self, "_treewy_state_layout", False):
+            # TreeWY owns one committed recurrent page per request. The
+            # accepted tree node is reconstructed into that page above, so the
+            # upstream Mamba cursor must keep addressing its sole page.
+            if isinstance(num_sampled, torch.Tensor):
+                num_sampled = torch.ones_like(num_sampled, dtype=torch.int32)
+            else:
+                num_sampled = 1
         super().postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
 
     def prepare_attn(
@@ -278,11 +352,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                     # width; take the tree width when one is active.
                     # Imported here to keep the model state import graph flat.
                     from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
-                        tree_state_slot_count,
+                        tree_verify_slot_count,
                     )
 
                     expected_query_len = (
-                        tree_state_slot_count(self.vllm_config) or self.vllm_config.num_speculative_tokens + 1
+                        tree_verify_slot_count(self.vllm_config) or self.vllm_config.num_speculative_tokens + 1
                     )
                     if np.all(padded_query_lens == expected_query_len):
                         # Full graph capture represents every padded request as
@@ -296,10 +370,17 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         tree_prev_num_sampled = None
         # Imported here to keep the model state import graph flat.
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
-            tree_state_slot_count,
+            tree_verify_slot_count,
         )
 
-        tree_slots = tree_state_slot_count(self.vllm_config)
+        tree_slots = tree_verify_slot_count(self.vllm_config)
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            selected_gdn_state_update_name,
+        )
+
+        self._treewy_state_layout = (
+            tree_slots is not None and selected_gdn_state_update_name() == "treewy"
+        )
         if tree_slots is not None:
             # Batch-order view of the paths recorded at the end of the previous
             # step. A padded or path-less request keeps 0, which leaves the
@@ -348,5 +429,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             for_cudagraph_capture=for_capture,
+        )
+        self._bind_treewy_contexts(
+            cudagraph_mode,
+            input_batch.num_reqs_after_padding,
+            input_batch.num_tokens_after_padding,
+            for_capture,
         )
         return self.attn_metadata

@@ -216,6 +216,91 @@ def test_a_root_only_tree_step_still_reanchors_from_its_node(tree_enabled, monke
     assert _reanchor_source(state, 0).tolist() == [[1, 2, _WIDTH - 1]]
 
 
+def test_graph_replay_reuses_the_captured_treewy_context_dictionary():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+        AscendMambaHybridModelState,
+    )
+
+    def metadata():
+        return SimpleNamespace(
+            spec_decode_metadata=SimpleNamespace(
+                gdn_state_update_method="treewy",
+                treewy_contexts={},
+            )
+        )
+
+    state = object.__new__(AscendMambaHybridModelState)
+    state.attn_metadata = {"layer": metadata()}
+    state._bind_treewy_contexts(CUDAGraphMode.NONE, 2, 10, for_capture=True)
+    captured_contexts = state.attn_metadata["layer"].spec_decode_metadata.treewy_contexts
+    captured_contexts["layer"] = object()
+
+    # Runtime metadata is newly built on each iteration; the state-commit
+    # phase still needs the static intermediates recorded by graph capture.
+    state.attn_metadata = {"layer": metadata()}
+    state._bind_treewy_contexts(CUDAGraphMode.FULL, 2, 10, for_capture=False)
+    replay_contexts = state.attn_metadata["layer"].spec_decode_metadata.treewy_contexts
+
+    assert replay_contexts is captured_contexts
+    assert replay_contexts["layer"] is not None
+    assert state._treewy_contexts_to_commit == [captured_contexts]
+
+
+def test_eager_treewy_context_does_not_replace_captured_graph_context():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+        AscendMambaHybridModelState,
+    )
+
+    def metadata():
+        return SimpleNamespace(
+            spec_decode_metadata=SimpleNamespace(
+                gdn_state_update_method="treewy",
+                treewy_contexts={},
+            )
+        )
+
+    state = object.__new__(AscendMambaHybridModelState)
+    state.attn_metadata = {"layer": metadata()}
+    state._bind_treewy_contexts(CUDAGraphMode.NONE, 2, 10, for_capture=True)
+    captured_contexts = state.attn_metadata["layer"].spec_decode_metadata.treewy_contexts
+
+    state.attn_metadata = {"layer": metadata()}
+    state._bind_treewy_contexts(CUDAGraphMode.NONE, 2, 10, for_capture=False)
+    eager_contexts = state.attn_metadata["layer"].spec_decode_metadata.treewy_contexts
+
+    assert eager_contexts is not captured_contexts
+    assert state._treewy_contexts_to_commit == [eager_contexts]
+
+
+def test_treewy_state_cursor_stays_on_its_single_recurrent_page(monkeypatch):
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+    from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+        AscendMambaHybridModelState,
+    )
+
+    observed = []
+
+    def capture_cursor(self, idx_mapping, num_sampled, num_computed_tokens=None):
+        observed.append(num_sampled.clone() if isinstance(num_sampled, torch.Tensor) else num_sampled)
+
+    monkeypatch.setattr(MambaHybridModelState, "postprocess_state", capture_cursor)
+    state = object.__new__(AscendMambaHybridModelState)
+    state._tree_resume_column = torch.tensor([4], dtype=torch.int32)
+    state._tree_path = None
+    state._tree_num_sampled = None
+    state._tree_is_tree_row = None
+    state._tree_prev_path = None
+    state._tree_prev_num_sampled = None
+    state._treewy_contexts_to_commit = []
+    state._treewy_state_layout = True
+
+    state.postprocess_state(torch.tensor([0]), torch.tensor([4], dtype=torch.int32))
+
+    assert observed[0].tolist() == [1]
+
+
 def test_tree_row_mask_follows_the_verified_token_count():
     """``tree_row_mask`` is the runner's decision, so pin its three cases."""
     # A single-token row (a decode the scheduler gave no draft token): the

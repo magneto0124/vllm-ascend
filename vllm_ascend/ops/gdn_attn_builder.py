@@ -39,6 +39,8 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import selected_gdn_state_update_name
+from vllm_ascend.worker.v2.spec_decode.tree.treewy import treewy_ancestor_mask
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -136,6 +138,21 @@ class GDNSpecDecodeMetadata:
     # per-call width. ``None`` keeps the plain single-call path (see
     # spec_decode/tree/state_rollback.TreeVerifyPlan).
     verify_plan: "TreeVerifyPlan | None" = None
+    # Tree layout has three independent widths: queries verified per request,
+    # recurrent state pages, and short-conv node activations retained per page.
+    # These are equal for ``snapshot`` but TreeWY uses a single recurrent page.
+    gdn_state_update_method: str | None = None
+    tree_verify_slots: int | None = None
+    tree_recurrent_state_slots: int | None = None
+    tree_conv_slots: int | None = None
+    tree_parents: torch.Tensor | None = None
+    tree_num_nodes: torch.Tensor | None = None
+    tree_ancestors: torch.Tensor | None = None
+    tree_row_widths: torch.Tensor | None = None
+    tree_sequence_indices: torch.Tensor | None = None
+    # Eager TreeWY stores each layer's recurrence scratch until sampling. In
+    # graph mode these references point at the captured static outputs.
+    treewy_contexts: dict[str, object] | None = None
 
 
 def _tree_conv_width(kv_cache_spec: AttentionSpec, mamba_type, state_columns: int) -> int | None:
@@ -337,6 +354,20 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             dtype=torch.int64,
             device=device,
         )
+        self.spec_tree_parents: torch.Tensor | None = None
+        self.spec_tree_num_nodes: torch.Tensor | None = None
+        self.spec_tree_ancestors: torch.Tensor | None = None
+        if self.spec_tree_slots is not None:
+            self.spec_tree_parents = torch.empty(
+                (sequence_index_capacity, self.spec_tree_slots - 1), dtype=torch.int32, device=device
+            )
+            self.spec_tree_num_nodes = torch.empty((sequence_index_capacity,), dtype=torch.int32, device=device)
+            if selected_gdn_state_update_name() == "treewy":
+                self.spec_tree_ancestors = torch.empty(
+                    (sequence_index_capacity, self.spec_tree_slots, self.spec_tree_slots),
+                    dtype=torch.bool,
+                    device=device,
+                )
         self.non_spec_sequence_indices: torch.Tensor = torch.empty(
             (sequence_index_capacity,),
             dtype=torch.int64,
@@ -365,11 +396,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         upstream constructor and have to stay in sync with it.
         """
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
-            tree_state_slot_count,
+            tree_verify_slot_count,
             validate_tree_state_slots,
         )
 
-        slots = tree_state_slot_count(self.vllm_config)
+        slots = tree_verify_slot_count(self.vllm_config)
         if slots is None:
             return
         mamba_type = getattr(self.kv_cache_spec, "mamba_type", None)
@@ -534,6 +565,21 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 "draft-tree GDN state rollback needs the tree layout; "
                 "tree_parents/tree_num_nodes were not passed to build()."
             )
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            selected_gdn_state_update_name,
+        )
+
+        if selected_gdn_state_update_name() == "treewy":
+            # TreeWY starts every node from the committed root state and solves
+            # the intra-tree recurrence with pseudo-values instead of parent
+            # state pages.
+            spec_query_lens_cpu = query_lens_cpu[spec_sequence_masks_cpu]
+            if bool(((spec_query_lens_cpu < 1) | (spec_query_lens_cpu > self.spec_tree_slots)).any()):
+                raise ValueError(
+                    "TreeWY GDN needs 1 <= verified tokens <= "
+                    f"1 + budget = {self.spec_tree_slots} per request."
+                )
+            return None
         slots = self.spec_tree_slots
         # A row may verify fewer than ``1 + budget`` tokens: the scheduler
         # truncates the draft of a request near ``max_model_len`` and the tree
@@ -558,6 +604,67 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             torch.index_select(tree_num_nodes, 0, spec_sequence_indices),
         )
         return _pack_tree_rows_to_tokens(init_state_indices, spec_query_lens_cpu, slots)
+
+    def _select_spec_state_indices(
+        self,
+        block_table_tensor: torch.Tensor,
+        spec_sequence_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select node pages, repeating the committed page for TreeWY rows."""
+        if self.spec_tree_slots is None:
+            return torch.index_select(
+                block_table_tensor[:, : self.num_spec + 1],
+                0,
+                spec_sequence_indices,
+            )
+
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            selected_gdn_state_update_name,
+        )
+
+        if selected_gdn_state_update_name() == "treewy":
+            root_pages = torch.index_select(block_table_tensor[:, :1], 0, spec_sequence_indices)
+            # The same page owns recurrent state and conv state for each request;
+            # only the conv state's internal columns vary by node.
+            return root_pages.expand(-1, self.spec_tree_slots)
+        return torch.index_select(
+            block_table_tensor[:, : self.spec_tree_slots],
+            0,
+            spec_sequence_indices,
+        )
+
+    def _select_tree_layout(
+        self,
+        tree_parents: torch.Tensor | None,
+        tree_num_nodes: torch.Tensor | None,
+        spec_sequence_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Gather tree topology into builder-owned buffers for graph stability."""
+        if self.spec_tree_slots is None:
+            return None, None
+        if tree_parents is None or tree_num_nodes is None:
+            raise RuntimeError(
+                "draft-tree GDN metadata needs tree_parents and tree_num_nodes."
+            )
+        if self.spec_tree_parents is None or self.spec_tree_num_nodes is None:
+            raise RuntimeError("draft-tree topology buffers were not allocated.")
+        num_rows = spec_sequence_indices.numel()
+        selected_parents = torch.index_select(tree_parents, 0, spec_sequence_indices)
+        selected_num_nodes = torch.index_select(tree_num_nodes, 0, spec_sequence_indices)
+        if selected_parents.shape[1] < self.spec_tree_slots - 1:
+            raise ValueError(
+                f"tree layout carries {selected_parents.shape[1]} parents for "
+                f"{self.spec_tree_slots} verify slots."
+            )
+        self.spec_tree_parents[:num_rows].copy_(selected_parents[:, : self.spec_tree_slots - 1])
+        self.spec_tree_num_nodes[:num_rows].copy_(selected_num_nodes)
+        if self.spec_tree_ancestors is not None:
+            # Topology changes every draft. Refresh a stable metadata buffer
+            # once per batch, outside each GDN layer and its captured graph.
+            self.spec_tree_ancestors[:num_rows].copy_(
+                treewy_ancestor_mask(self.spec_tree_parents[:num_rows], self.spec_tree_num_nodes[:num_rows])
+            )
+        return self.spec_tree_parents[:num_rows], self.spec_tree_num_nodes[:num_rows]
 
     def _build_tree_conv_rows(
         self,
@@ -802,6 +909,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         init_state_indices: torch.Tensor | None = None,
         conv_window_rows: torch.Tensor | None = None,
         conv_prefix_src: torch.Tensor | None = None,
+        tree_parents: torch.Tensor | None = None,
+        tree_num_nodes: torch.Tensor | None = None,
+        tree_sequence_indices: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         attn_metadata.spec_decode_metadata = None
         if attn_metadata.spec_sequence_masks is None:
@@ -831,6 +941,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # tables by packed token offset, so it is only built when the tree packing
         # ran -- ``build`` gates that on the tree conv rows.
         verify_plan = None
+        state_update_method = None
+        recurrent_state_slots = None
+        conv_slots = None
         if conv_window_rows is not None:
             verify_plan = self._build_tree_verify_plan(
                 actual_seq_lengths[1:],
@@ -838,6 +951,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 None if init_state_indices is None else init_state_indices[:spec_num_rows],
                 attn_metadata.num_actual_tokens,
             )
+            from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+                selected_gdn_state_update_name,
+                tree_conv_slot_count,
+                tree_recurrent_state_slot_count,
+            )
+
+            state_update_method = selected_gdn_state_update_name()
+            recurrent_state_slots = tree_recurrent_state_slot_count(self.vllm_config)
+            conv_slots = tree_conv_slot_count(self.vllm_config)
 
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
             spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
@@ -850,6 +972,22 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             conv_window_rows=conv_window_rows,
             conv_prefix_src=conv_prefix_src,
             verify_plan=verify_plan,
+            gdn_state_update_method=state_update_method,
+            tree_verify_slots=self.spec_tree_slots if conv_window_rows is not None else None,
+            tree_recurrent_state_slots=recurrent_state_slots,
+            tree_conv_slots=conv_slots,
+            tree_parents=tree_parents,
+            tree_num_nodes=tree_num_nodes,
+            tree_ancestors=(
+                self.spec_tree_ancestors[:tree_parents.shape[0]]
+                if state_update_method == "treewy"
+                and tree_parents is not None
+                and self.spec_tree_ancestors is not None
+                else None
+            ),
+            tree_row_widths=actual_seq_lengths[1:] if conv_window_rows is not None else None,
+            tree_sequence_indices=tree_sequence_indices,
+            treewy_contexts={} if state_update_method == "treewy" else None,
         )
         return attn_metadata
 
@@ -895,6 +1033,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_accepted_tokens: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Advance stateful spec-width prompt chunks through live spec inputs."""
+        if self.spec_tree_slots is not None and selected_gdn_state_update_name() == "treewy":
+            # TreeWY defers state writes until speculative acceptance. A prompt
+            # chunk must commit every input token even when its sampler emits
+            # only one token (final chunk), or no tree path exists at all.
+            # Keep it on the native prefill path, which commits during forward.
+            return spec_sequence_masks_cpu, num_accepted_tokens
         is_prefilling = common_attn_metadata.is_prefilling
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
         if is_prefilling is None or seq_lens_cpu is None or num_accepted_tokens is None:
@@ -952,6 +1096,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         spec_sequence_masks_cpu: torch.Tensor | None = None
         spec_sequence_indices: torch.Tensor | None = None
         non_spec_sequence_indices: torch.Tensor | None = None
+        spec_tree_parents: torch.Tensor | None = None
+        spec_tree_num_nodes: torch.Tensor | None = None
+        spec_tree_sequence_indices: torch.Tensor | None = None
         non_spec_conv1d_cache_indices: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
@@ -991,6 +1138,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     spec_sequence_masks_cpu,
                     num_spec_decodes,
                 )
+                if self.spec_tree_slots is not None:
+                    spec_tree_parents, spec_tree_num_nodes = self._select_tree_layout(
+                        tree_parents,
+                        tree_num_nodes,
+                        spec_sequence_indices,
+                    )
+                    spec_tree_sequence_indices = spec_sequence_indices
 
         spec_init_state_indices: torch.Tensor | None = None
         spec_conv_window_rows: torch.Tensor | None = None
@@ -1047,9 +1201,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
-                spec_state_indices_tensor = torch.index_select(
-                    block_table_tensor[:, : self.num_spec + 1],
-                    0,
+                spec_state_indices_tensor = self._select_spec_state_indices(
+                    block_table_tensor,
                     spec_sequence_indices,
                 )
                 non_spec_state_indices_tensor = None
@@ -1067,9 +1220,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
 
-                spec_state_indices_tensor = torch.index_select(
-                    block_table_tensor[:, : self.num_spec + 1],
-                    0,
+                spec_state_indices_tensor = self._select_spec_state_indices(
+                    block_table_tensor,
                     spec_sequence_indices,
                 )
                 non_spec_state_indices_tensor = torch.index_select(
@@ -1146,7 +1298,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prev_num_sampled,
                 row_widths=spec_row_widths,
             )
-            if spec_init_state_indices is not None and self.spec_conv_window_rows is not None:
+            if spec_conv_window_rows is not None and self.spec_conv_window_rows is not None:
                 # Same packing for the state pages: the recurrent op consumes
                 # them by global token offset, like the init pages and the conv
                 # windows. The conv path keeps reading the table per row, taking
@@ -1373,6 +1525,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_init_state_indices,
             spec_conv_window_rows,
             spec_conv_prefix_src,
+            spec_tree_parents,
+            spec_tree_num_nodes,
+            spec_tree_sequence_indices,
         )
         return self._attach_non_spec_decode_metadata(
             attn_metadata,

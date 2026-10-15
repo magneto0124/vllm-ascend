@@ -815,9 +815,11 @@ class NPUModelRunner(GPUModelRunner):
         ``super().postprocess_sampled``) records ``max(num_sampled, 1)`` as the
         state slot the next step resumes from, which assumes the accepted tokens
         are a prefix of the verified chain. Under a draft tree they are a
-        root-to-leaf path instead, so the slot has to be the last accepted node
-        (see ``compute_tree_resume_column``). The accepted path itself is staged
-        too: the short conv rebuilds its committed history from those nodes.
+        root-to-leaf path instead, so snapshot state resumes from the last
+        accepted node (see ``compute_tree_resume_column``). TreeWY uses the same
+        path to reconstruct its state into one page and normalizes that page's
+        cursor in ``postprocess_state``. The short conv also uses the staged
+        path to rebuild its committed history.
         ``num_sampled``/``idx_mapping`` are in batch order, exactly like the
         paths produced by the tree sampler, and ``num_rejected`` tells which of
         those rows the tree op actually verified (see ``tree_row_mask``).

@@ -105,20 +105,31 @@ def tree_causal_conv1d(
     # exactly the rows of ``x``.
     pages = cache_indices.reshape(-1)[starts[:rows]].to(torch.long).clamp(min=0)
     valid = torch.diff(starts) > 0
-    page_ids = pages[valid]
+    # Keep the row dimension fixed for torch.compile/ACL graph capture.  A
+    # boolean index such as ``pages[valid]`` produces a dynamically sized
+    # tensor when full-graph padding is present, which is not representable in
+    # the captured graph.  Inactive rows use their harmless page and are
+    # masked out below, so every intermediate keeps the fixed ``rows`` shape.
+    page_ids = pages
     dim_first = is_conv_state_dim_first()
 
     # Re-anchor the committed history on the node the sampler accepted last
     # step, before reading it: the page still holds that step's node
     # activations in columns [width - 1, width - 1 + slots).
     state = conv_state[page_ids]
-    columns = prefix_src[valid].to(torch.long)
+    columns = prefix_src.to(torch.long)
     if dim_first:
         columns = columns.unsqueeze(1).expand(-1, conv_dim, -1)
-        conv_state[page_ids, :, : width - 1] = state.gather(2, columns)
+        gathered = state.gather(2, columns)
+        current = state[:, :, : width - 1]
+        updated = torch.where(valid[:, None, None], gathered, current)
+        conv_state[page_ids, :, : width - 1] = updated
     else:
         columns = columns.unsqueeze(-1).expand(-1, -1, conv_dim)
-        conv_state[page_ids, : width - 1, :] = state.gather(1, columns)
+        gathered = state.gather(1, columns)
+        current = state[:, : width - 1, :]
+        updated = torch.where(valid[:, None, None], gathered, current)
+        conv_state[page_ids, : width - 1, :] = updated
 
     state = conv_state[pages]
     history = state[:, :, : width - 1].transpose(1, 2) if dim_first else state[:, : width - 1, :]
@@ -660,47 +671,99 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             init_state_indices = attn_metadata.spec_decode_metadata.init_state_indices
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
-            verify_plan = attn_metadata.spec_decode_metadata.verify_plan
-            if verify_plan is not None:
-                # Draft tree wider than one recurrent-op call: verify it in
-                # chunks of node columns (see _chunked_tree_verify).
-                core_attn_out_spec = _chunked_tree_verify(
-                    query_spec,
-                    key_spec,
-                    value_spec,
-                    g_spec,
-                    beta_spec,
-                    ssm_state,
-                    spec_state_indices_tensor,
-                    spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
-                    scale=key_spec.shape[-1] ** -0.5,
-                    plan=verify_plan,
-                    num_actual_tokens=num_actual_tokens,
-                ).unsqueeze(0)
-            else:
-                # Dispatches to the vllm-ascend AscendC custom operator
-                # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
-                # The custom op extends dtype support (e.g. float32 state) and is
-                # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
-                spec_recurrent_kwargs = {}
-                if init_state_indices is not None:
-                    # Draft tree: every node loads its state from its parent's slot
-                    # (see spec_decode/tree/state_rollback.py). The op must be built
-                    # with the ``init_state_indices`` input.
-                    spec_recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
-                core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                    query=query_spec.squeeze(0),
+            spec_metadata = attn_metadata.spec_decode_metadata
+            if spec_metadata.gdn_state_update_method == "treewy":
+                if (
+                    spec_metadata.tree_parents is None
+                    or spec_metadata.tree_num_nodes is None
+                    or spec_metadata.tree_row_widths is None
+                    or spec_metadata.tree_sequence_indices is None
+                    or spec_metadata.treewy_contexts is None
+                ):
+                    raise RuntimeError("TreeWY GDN metadata is missing its tree layout or scratch context.")
+                from vllm_ascend.worker.v2.spec_decode.tree.treewy import (
+                    TreeWYLayerContext,
+                    treewy_verify_torch,
+                )
+
+                row_starts = spec_causal_conv1d_meta.query_start_loc[:-1].to(torch.long)
+                root_state_indices = (
+                    spec_state_indices_tensor.reshape(-1)
+                    .index_select(0, row_starts)
+                    .clamp_min(0)
+                )
+                # index_select already materializes an independent buffer; a
+                # second clone only adds a full recurrent-state copy per layer.
+                initial_state = ssm_state.index_select(0, root_state_indices.to(torch.long))
+                tree_result = treewy_verify_torch(
+                    query_spec.squeeze(0),
+                    key_spec.squeeze(0),
+                    value_spec.squeeze(0),
+                    g_spec.squeeze(0),
+                    beta_spec.squeeze(0),
+                    initial_state,
+                    spec_metadata.tree_parents,
+                    spec_metadata.tree_row_widths,
+                    key_spec.shape[-1] ** -0.5,
+                    spec_metadata.tree_num_nodes,
+                    ancestors=spec_metadata.tree_ancestors,
+                )
+                spec_metadata.treewy_contexts[self.prefix] = TreeWYLayerContext(
                     key=key_spec.squeeze(0),
-                    value=value_spec.squeeze(0),
-                    g=g_spec.squeeze(0),
-                    beta=beta_spec.squeeze(0),
+                    pseudo_values=tree_result.pseudo_values,
+                    log_decay=tree_result.log_decay,
+                    tree_parents=spec_metadata.tree_parents,
+                    tree_num_nodes=spec_metadata.tree_num_nodes,
+                    row_widths=spec_metadata.tree_row_widths,
+                    sequence_indices=spec_metadata.tree_sequence_indices,
+                    root_state_indices=root_state_indices,
+                    initial_state=initial_state,
                     state=ssm_state,
-                    scale=key_spec.shape[-1] ** -0.5,
-                    actual_seq_lengths=actual_seq_lengths,
-                    ssm_state_indices=spec_state_indices_tensor.flatten(),
-                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
-                    **spec_recurrent_kwargs,
-                ).unsqueeze(0)
+                    ancestors=tree_result.ancestors,
+                )
+                core_attn_out_spec = tree_result.output.unsqueeze(0)
+            else:
+                verify_plan = spec_metadata.verify_plan
+                if verify_plan is not None:
+                    # Draft tree wider than one recurrent-op call: verify it in
+                    # chunks of node columns (see _chunked_tree_verify).
+                    core_attn_out_spec = _chunked_tree_verify(
+                        query_spec,
+                        key_spec,
+                        value_spec,
+                        g_spec,
+                        beta_spec,
+                        ssm_state,
+                        spec_state_indices_tensor,
+                        spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                        scale=key_spec.shape[-1] ** -0.5,
+                        plan=verify_plan,
+                        num_actual_tokens=num_actual_tokens,
+                    ).unsqueeze(0)
+                else:
+                    # Dispatches to the vllm-ascend AscendC custom operator
+                    # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
+                    # The custom op extends dtype support (e.g. float32 state) and is
+                    # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
+                    spec_recurrent_kwargs = {}
+                    if init_state_indices is not None:
+                        # Draft tree: every node loads its state from its parent's slot
+                        # (see spec_decode/tree/state_rollback.py). The op must be built
+                        # with the ``init_state_indices`` input.
+                        spec_recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
+                    core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                        query=query_spec.squeeze(0),
+                        key=key_spec.squeeze(0),
+                        value=value_spec.squeeze(0),
+                        g=g_spec.squeeze(0),
+                        beta=beta_spec.squeeze(0),
+                        state=ssm_state,
+                        scale=key_spec.shape[-1] ** -0.5,
+                        actual_seq_lengths=actual_seq_lengths,
+                        ssm_state_indices=spec_state_indices_tensor.flatten(),
+                        num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                        **spec_recurrent_kwargs,
+                    ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 

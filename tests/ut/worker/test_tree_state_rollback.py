@@ -16,7 +16,10 @@ from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     compute_tree_init_state_indices,
     compute_tree_resume_column,
     compute_tree_verify_plan,
+    tree_conv_slot_count,
+    tree_recurrent_state_slot_count,
     tree_state_slot_count,
+    tree_verify_slot_count,
     tree_verify_chunk_count,
     validate_tree_state_slots,
 )
@@ -108,6 +111,21 @@ def test_slot_count_follows_budget_when_tree_enabled(tree_enabled):
     tree_enabled(budget=_BUDGET)
 
     assert tree_state_slot_count(_config()) == 1 + _BUDGET
+    assert tree_verify_slot_count(_config()) == 1 + _BUDGET
+    assert tree_conv_slot_count(_config()) == 1 + _BUDGET
+
+
+def test_treewy_layout_separates_verify_conv_and_recurrent_widths(tree_enabled):
+    tree_enabled(budget=_BUDGET, gdn_state_update="treewy")
+    config = _config()
+
+    assert tree_verify_slot_count(config) == 1 + _BUDGET
+    assert tree_conv_slot_count(config) == 1 + _BUDGET
+    assert tree_recurrent_state_slot_count(config) == 1
+    assert tree_state_slot_count(config) == 1
+    method = GDN_STATE_UPDATE_METHODS["treewy"]
+    assert method.treewy_solver and method.conv and method.recurrent_state_slots == 1
+    validate_tree_state_slots(1 + _BUDGET, MambaAttentionBackendEnum.GDN_ATTN)
 
 
 def test_slot_count_ignores_tree_without_v2_runner(tree_enabled):
@@ -319,6 +337,21 @@ def test_widen_mamba_spec_widens_the_conv_page_at_chain_width(tree_enabled, monk
     assert widened.shapes[0] == (_CONV_DIM, spec.shapes[0][1] + 1)
     assert widened.shapes[1] == spec.shapes[1]
     assert widened.page_size_padded == spec.page_size_padded + _CONV_DIM * 2
+
+
+def test_widen_mamba_spec_keeps_one_recurrent_page_for_treewy(tree_enabled, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.attn_utils.is_conv_state_dim_first",
+        lambda: True,
+    )
+    spec = _spec()
+    tree_enabled(budget=_BUDGET, gdn_state_update="treewy")
+
+    widened = _widen_mamba_spec_for_tree(spec, _config())
+
+    assert widened.num_speculative_blocks == 0
+    assert widened.shapes[0] == (_CONV_DIM, _CONV_WIDTH_MINUS_1 + 1 + _BUDGET)
+    assert widened.shapes[1] == spec.shapes[1]
 
 
 def test_tree_path_buffers_keep_the_tree_width(tree_enabled):

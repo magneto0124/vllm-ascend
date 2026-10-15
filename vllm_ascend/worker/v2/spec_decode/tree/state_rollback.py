@@ -3,24 +3,21 @@
 ``tree_spec_config`` verifies a draft *tree*: the target model runs
 ``1 + budget`` tokens per request (the already-accepted root plus ``budget``
 non-root nodes) and acceptance walks one root-to-leaf path through them. GDN
-caches one recurrent state per page, so the state layout has to follow the tree
-instead of the linear MTP chain:
+caches one recurrent state per page, so speculative verification needs an
+explicit state-update strategy instead of assuming a linear MTP chain:
 
-* state slot ``j`` (0-based) holds the recurrent state *after* tree node ``j``;
-  slot 0 is the root, whose state is the committed prefix state, and slot
-  ordering matches node id ordering (every builder guarantees
-  ``parent_id < node_id``);
-* node ``j`` starts from its parent's slot, so dropping the rejected siblings is
-  a pure index change -- no state copy and no recomputation;
-* after sampling, the next step resumes from the last *accepted* node, which is
-  what :func:`compute_tree_resume_column` computes for
-  ``MambaHybridModelState.postprocess_state``.
+* ``snapshot`` stores the recurrent state after each verified node. Node ``j``
+  starts from its parent's page; after sampling, the next step resumes from the
+  last accepted node, as computed by :func:`compute_tree_resume_column`;
+* ``treewy`` keeps only the committed recurrent page, stores TreeWY
+  pseudo-values during verification, then reconstructs and writes the accepted
+  state after sampling. Its implementation is in :mod:`treewy`.
 
-The number of slots (``1 + budget``) is what
+The verify width and short-conv activation capacity (``1 + budget``) are what
 ``vllm_ascend.worker.v2.attn_utils.get_kv_cache_spec`` widens ``MambaSpec`` to and
-what ``AscendGDNAttentionMetadataBuilder`` sizes its spec buffers by. It is
-larger than the chain width (``1 + num_speculative_tokens``), hence the state
-memory and per-step state traffic grow with the tree width.
+what ``AscendGDNAttentionMetadataBuilder`` sizes its spec buffers by. Recurrent
+state capacity is independent: it is ``1 + budget`` for snapshots and one page
+for TreeWY.
 
 Only the Qwen GDN path (``MambaAttentionBackendEnum.GDN_ATTN``) is wired up so
 far; :func:`validate_tree_state_slots` rejects a draft tree on any other state
@@ -28,10 +25,13 @@ backend (KDA, Mamba1/2, short-conv, pure linear attention) instead of silently
 serving stale states.
 
 ``tree_spec_config.gdn_state_update`` selects *how* the state follows the tree;
-``"snapshot"`` (the default, and the method this module implements) is the
-per-node snapshot described above. The setting is read, and validated, on this
-GDN path only, so it stays inert for any other state backend -- see
+``"snapshot"`` is the default. The setting is read, and validated, on this GDN
+path only, so it stays inert for any other state backend -- see
 :data:`GDN_STATE_UPDATE_METHODS` and :func:`validate_tree_state_slots`.
+
+TreeWY currently uses the PyTorch tensor implementation as its Ascend execution
+path. A fused Ascend operator and NPU performance validation remain follow-up
+work.
 
 The kernel side is tree-agnostic: :func:`compute_tree_init_state_indices` turns
 the ``[R, slots]`` page table plus the tree's parent ids into a per-token table
@@ -73,16 +73,16 @@ class GdnStateUpdateMethod:
     state_init: bool
     conv: bool
     description: str
+    recurrent_state_slots: int | None = None
+    treewy_solver: bool = False
+    implemented: bool = True
 
 
-# Only implemented methods are registered, and ``tree_spec_config.gdn_state_update``
-# is read -- and validated against this registry -- on the GDN path only, so the
-# setting stays inert (never an error) for every other state backend. See
-# :func:`validate_tree_state_slots` and :func:`selected_gdn_state_update_method`.
+# ``tree_spec_config.gdn_state_update`` is read on the GDN path only, so the
+# setting stays inert for every other state backend.
 #
-# A new method has to touch three places: :func:`tree_state_slot_count` (state
-# layout), ``AscendGDNAttentionMetadataBuilder._build_tree_init_state_indices``
-# (per-node initial states) and ``ops/gdn.tree_causal_conv1d`` (short conv).
+# A new method has to define its recurrent layout, provide the verify/commit
+# path consumed by the attention metadata, and preserve the short-conv history.
 GDN_STATE_UPDATE_METHODS: dict[str, GdnStateUpdateMethod] = {
     "snapshot": GdnStateUpdateMethod(
         state_init=True,
@@ -93,12 +93,22 @@ GDN_STATE_UPDATE_METHODS: dict[str, GdnStateUpdateMethod] = {
             "activations with the history re-anchored on the node the sampler accepted"
         ),
     ),
+    "treewy": GdnStateUpdateMethod(
+        state_init=False,
+        conv=True,
+        description=(
+            "one recurrent state page per request, with TreeWY pseudo-values retained "
+            "until the accepted path is known"
+        ),
+        recurrent_state_slots=1,
+        treewy_solver=True,
+    ),
 }
 DEFAULT_GDN_STATE_UPDATE = "snapshot"
 
 
-def selected_gdn_state_update_method() -> GdnStateUpdateMethod:
-    """The draft-tree GDN state update method ``tree_spec_config`` selects.
+def selected_gdn_state_update_name() -> str:
+    """Name of the draft-tree GDN state update method from ``tree_spec_config``.
 
     The name is resolved here instead of in ``TreeSpecConfig`` because the setting
     only means something for GDN state backends: a model that does not use GDN
@@ -111,22 +121,25 @@ def selected_gdn_state_update_method() -> GdnStateUpdateMethod:
         "gdn_state_update",
         DEFAULT_GDN_STATE_UPDATE,
     )
-    method = GDN_STATE_UPDATE_METHODS.get(name)
-    if method is None:
+    if name not in GDN_STATE_UPDATE_METHODS:
         raise ValueError(
             "tree_spec_config.gdn_state_update must be one of "
             f"{tuple(GDN_STATE_UPDATE_METHODS)}, got {name!r}"
         )
-    return method
+    return name
 
 
-def tree_state_slot_count(vllm_config) -> int | None:
-    """Number of GDN state slots needed per request.
+def selected_gdn_state_update_method() -> GdnStateUpdateMethod:
+    """The draft-tree GDN state update method ``tree_spec_config`` selects."""
+    return GDN_STATE_UPDATE_METHODS[selected_gdn_state_update_name()]
+
+
+def tree_verify_slot_count(vllm_config) -> int | None:
+    """Number of tokens the target verifies per request under a draft tree.
 
     Returns ``None`` when no draft tree is active, i.e. the caller must keep the
-    linear-chain layout. ``1 + budget`` is the layout of the ``"snapshot"`` state
-    update method, which caches one state per tree node; a method with a different
-    layout changes this function (see :data:`GDN_STATE_UPDATE_METHODS`).
+    linear-chain layout. This is ``1 + budget`` for every state update method;
+    it is deliberately independent of the recurrent-state and conv-cache layouts.
     """
     from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
@@ -149,8 +162,8 @@ def tree_state_slot_count(vllm_config) -> int | None:
         # its short-conv window by ``num_accepted_tokens - 1``. A draft tree
         # cannot express that: the cursor is a node id and a node's window is
         # its own root-to-node chain instead of the previous batch entry, so the
-        # shifted window would silently corrupt the conv history. The recurrent
-        # state does not care: every node keeps its own page.
+        # shifted window would silently corrupt the conv history. Recurrent-state
+        # capacity is handled separately by the selected GDN update method.
         raise NotImplementedError(
             "tree_spec_config is not supported with mamba_cache_mode='align' "
             "yet; the align pre-copy shift of the short-conv state has no "
@@ -158,6 +171,31 @@ def tree_state_slot_count(vllm_config) -> int | None:
             "tree_spec_config."
         )
     return 1 + budget
+
+
+def tree_conv_slot_count(vllm_config) -> int | None:
+    """Number of node activations the short-conv cache retains per request."""
+    return tree_verify_slot_count(vllm_config)
+
+
+def tree_recurrent_state_slot_count(vllm_config) -> int | None:
+    """Number of recurrent-state slots required by the selected GDN method.
+
+    ``snapshot`` stores a state for every verified node. TreeWY uses one page
+    for the committed state and reconstructs the accepted state after sampling.
+    Keep this separate from :func:`tree_verify_slot_count`, which remains the
+    tree's query width for both methods.
+    """
+    verify_slots = tree_verify_slot_count(vllm_config)
+    if verify_slots is None:
+        return None
+    method = selected_gdn_state_update_method()
+    return method.recurrent_state_slots or verify_slots
+
+
+def tree_state_slot_count(vllm_config) -> int | None:
+    """Backward-compatible name for :func:`tree_recurrent_state_slot_count`."""
+    return tree_recurrent_state_slot_count(vllm_config)
 
 
 def validate_tree_state_slots(slots: int, mamba_type) -> None:
@@ -183,8 +221,15 @@ def validate_tree_state_slots(slots: int, mamba_type) -> None:
     # ``tree_spec_config.gdn_state_update`` mean anything: an unknown method, or a
     # method that does not carry one half of the state across the tree, is refused
     # here -- never for a model that does not use GDN.
-    method = selected_gdn_state_update_method()
-    if not method.state_init:
+    method_name = selected_gdn_state_update_name()
+    method = GDN_STATE_UPDATE_METHODS[method_name]
+    if not method.implemented:
+        raise NotImplementedError(
+            f"tree_spec_config.gdn_state_update={method_name!r} has a reserved cache "
+            "layout, but its verification and accepted-state commit path is not "
+            "wired up yet."
+        )
+    if not method.state_init and not method.treewy_solver:
         raise NotImplementedError(
             "the configured tree_spec_config.gdn_state_update does not carry the "
             "recurrent state across a draft tree yet: the recurrent kernel would "

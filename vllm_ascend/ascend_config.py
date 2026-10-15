@@ -1079,12 +1079,19 @@ class TreeSpecConfig:
     ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
 
     ``gdn_state_update`` selects how the linear-attention (GDN) state follows the
-    draft tree. Only ``"snapshot"`` is implemented so far: it caches one
-    recurrent state per tree node, so a rejected sibling is dropped by an index
-    change instead of a state copy. The key is read, and validated, only when the
-    model really uses GDN state (see
-    ``worker.v2.spec_decode.tree.state_rollback.GDN_STATE_UPDATE_METHODS``), so on
-    any other model it has no effect and an unrecognized value is not reported.
+    draft tree:
+
+    - ``"snapshot"`` (default) keeps one recurrent state page per verified node;
+      after sampling, the next step resumes from the last accepted node.
+    - ``"treewy"`` keeps one committed recurrent state page and reconstructs
+      the accepted state from TreeWY pseudo-values after sampling. Its current
+      Ascend path uses PyTorch tensor operations; a fused Ascend kernel and
+      performance validation are still pending.
+
+    The key is read, and validated, only when the model really uses GDN state
+    (see ``worker.v2.spec_decode.tree.state_rollback.GDN_STATE_UPDATE_METHODS``),
+    so on any other model it has no effect and an unrecognized value is not
+    reported.
 
     ``enable_triton`` (default True) runs tree hot-path Triton kernels when
     Triton is available; set False to force torch fallbacks.
@@ -1118,9 +1125,9 @@ class TreeSpecConfig:
     budget: int | None = None
     topk: int | None = None
     rejection_sampler: str = "greedy"
-    # GDN-only: how the linear-attention state follows the draft tree. Read on
-    # the GDN path only, so it is inert for every other state backend (the
-    # registry lives in worker.v2.spec_decode.tree.state_rollback).
+    # GDN-only: "snapshot" (default) keeps one recurrent page per tree node;
+    # "treewy" keeps one page and reconstructs the accepted state after sample.
+    # Read on the GDN path only, so it is inert for every other state backend.
     gdn_state_update: str = "snapshot"
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
     # When true, print segment timings at process exit.
