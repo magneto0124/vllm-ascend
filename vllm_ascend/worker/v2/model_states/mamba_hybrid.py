@@ -429,6 +429,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             for_cudagraph_capture=for_capture,
+            # Ordinary attention in a hybrid model must use the same tree as
+            # GDN. Without this, eager uses a causal mask and FULL retains the
+            # dummy tree mask created during capture.
+            tree_visibility=input_batch.tree_visibility,
         )
         self._bind_treewy_contexts(
             cudagraph_mode,

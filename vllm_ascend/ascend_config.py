@@ -1173,7 +1173,7 @@ class TreeSpecConfig:
             logger.warning_once(
                 "tree_spec_config.params has unrecognized keys %s; "
                 "current builders ignore them.",
-                sorted(unknown),
+                tuple(sorted(unknown)),
             )
         return self
 

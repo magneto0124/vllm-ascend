@@ -42,7 +42,42 @@ from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_grap
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+from vllm_ascend.worker.v2.tree_graph_diag import TreeGraphAudit
 from vllm_ascend.worker.v2.utils import communicator_switch
+
+
+# Temporary diagnostics for the target/draft graph mismatch investigation.
+# Keep this constant local to the module so it can be removed after the issue
+# is diagnosed without introducing a user-facing environment variable.
+TREE_DIAG_ENABLED = True
+
+
+def tree_diag_claim(seen: set[Any], key: Any) -> bool:
+    if not TREE_DIAG_ENABLED or key in seen:
+        return False
+    seen.add(key)
+    return True
+
+
+def tree_diag_once(seen: set[Any], key: Any, msg: str, *args: Any) -> None:
+    if not tree_diag_claim(seen, key):
+        return
+    logger.warning("[TREE-DIAG] " + msg, *args)
+
+
+def _diag_descs(capture_descs: dict) -> list[tuple[Any, ...]]:
+    return [
+        (
+            str(mode),
+            getattr(desc, "num_tokens", None),
+            getattr(desc, "num_reqs", None),
+            getattr(desc, "uniform_token_count", None),
+            getattr(desc, "max_query_len", None),
+            getattr(desc, "num_active_loras", None),
+        )
+        for mode, descs in capture_descs.items()
+        for desc in descs
+    ]
 
 
 def _prepare_pcp_inputs_to_capture(
@@ -134,10 +169,76 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
+        self.tree_graph_audit = TreeGraphAudit()
         self.update_stream = self.model_runner.update_stream
+        self._tree_diag_seen: set[Any] = set()
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+        if TREE_DIAG_ENABLED:
+            logger.warning(
+                "[TREE-DIAG] graph init: model=%s mode=%s decode_query_len=%s "
+                "configured_sizes=%s resolved_sizes=%s max_num_reqs=%s "
+                "descs=%s needs_capture=%s",
+                getattr(getattr(vllm_config, "model_config", None), "model", "unknown"),
+                cudagraph_mode,
+                decode_query_len,
+                vllm_config.compilation_config.cudagraph_capture_sizes,
+                self.capture_sizes,
+                getattr(self, "max_num_reqs", None),
+                _diag_descs(self._capture_descs),
+                super().needs_capture(),
+            )
+
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+    ) -> BatchExecutionDescriptor:
+        desc = super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+            max_query_len=max_query_len,
+        )
+        if TREE_DIAG_ENABLED:
+            model_name = getattr(getattr(self.vllm_config, "model_config", None), "model", "unknown")
+            key = (
+                "dispatch",
+                str(model_name),
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                num_active_loras,
+                max_query_len,
+                str(desc.cg_mode),
+                desc.num_tokens,
+            )
+            tree_diag_once(
+                self._tree_diag_seen,
+                key,
+                "dispatch: model=%s runtime(tokens=%s reqs=%s uniform=%s "
+                "max_query=%s loras=%s) -> desc(mode=%s tokens=%s reqs=%s "
+                "uniform=%s max_query=%s) candidates=%s%s",
+                model_name,
+                num_tokens,
+                num_reqs,
+                uniform_token_count,
+                max_query_len,
+                num_active_loras,
+                desc.cg_mode,
+                desc.num_tokens,
+                desc.num_reqs,
+                desc.uniform_token_count,
+                desc.max_query_len,
+                _diag_descs(self._capture_descs),
+                " FALLBACK_EAGER" if desc.cg_mode == CUDAGraphMode.NONE else "",
+            )
+        return desc
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
@@ -146,6 +247,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
+        self.tree_graph_audit.report(self.model_runner.model_state.attn_metadata, logger.warning)
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
         self.update_stream.wait_stream(torch.npu.current_stream())
@@ -202,44 +304,60 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         pcp_manager: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
-        model = ModelWithContext(model)
+        if TREE_DIAG_ENABLED:
+            logger.warning(
+                "[TREE-DIAG] capture begin: descs=%s", _diag_descs(self._capture_descs)
+            )
+        model = ModelWithContext(model, tree_graph_audit=self.tree_graph_audit)
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         if pcp_manager is not None:
             cudagraph_utils.prepare_inputs_to_capture = partial(
                 _prepare_pcp_inputs_to_capture,
                 pcp_manager=pcp_manager,
             )
-        with communicator_switch():
-            # vLLM #53869 added pcp_manager to ModelCudaGraphManager.capture on
-            # main; v0.28.0 still uses the older signature without that kwarg.
-            if not vllm_version_is("0.28.0"):
-                return super().capture(
-                    model,
-                    model_state,
-                    input_buffers,
-                    intermediate_tensors,
-                    block_tables,
-                    attn_groups,
-                    kv_cache_config,
-                    pcp_manager=pcp_manager,
-                    has_lora=has_lora,
-                    use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
-                    lora_capture_hook=lora_capture_hook,
-                    progress_bar_desc=progress_bar_desc,
-                )
-            return super().capture(
-                model,
-                model_state,
-                input_buffers,
-                intermediate_tensors,
-                block_tables,
-                attn_groups,
-                kv_cache_config,
-                has_lora=has_lora,
-                use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
-                lora_capture_hook=lora_capture_hook,
-                progress_bar_desc=progress_bar_desc,
+        try:
+            with communicator_switch():
+                # vLLM #53869 added pcp_manager to ModelCudaGraphManager.capture on
+                # main; v0.28.0 still uses the older signature without that kwarg.
+                if not vllm_version_is("0.28.0"):
+                    result = super().capture(
+                        model,
+                        model_state,
+                        input_buffers,
+                        intermediate_tensors,
+                        block_tables,
+                        attn_groups,
+                        kv_cache_config,
+                        pcp_manager=pcp_manager,
+                        has_lora=has_lora,
+                        use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
+                        lora_capture_hook=lora_capture_hook,
+                        progress_bar_desc=progress_bar_desc,
+                    )
+                else:
+                    result = super().capture(
+                        model,
+                        model_state,
+                        input_buffers,
+                        intermediate_tensors,
+                        block_tables,
+                        attn_groups,
+                        kv_cache_config,
+                        has_lora=has_lora,
+                        use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
+                        lora_capture_hook=lora_capture_hook,
+                        progress_bar_desc=progress_bar_desc,
+                    )
+        except Exception:
+            logger.exception("[TREE-DIAG] capture failed")
+            raise
+        if TREE_DIAG_ENABLED:
+            logger.warning(
+                "[TREE-DIAG] capture done: graphs=%s captured_tokens=%s",
+                len(self.graphs),
+                self.captured_token_counts(),
             )
+        return result
 
 
 class ModelWithContext(nn.Module):
@@ -247,26 +365,56 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False):
+    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, tree_graph_audit=None):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
+        self.tree_graph_audit = tree_graph_audit
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
         # In warmup phase, capturing=False by default.
         # when capturing, we need to set capturing=True in forward context.
-        _EXTRA_CTX.capturing = (
+        is_capturing = (
             torch.npu.is_current_stream_capturing()
             and forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
         )
+        _EXTRA_CTX.capturing = is_capturing
+        if is_capturing and self.tree_graph_audit is not None:
+            self.tree_graph_audit.record(forward_context.attn_metadata)
         if self.is_draft_model:
             _EXTRA_CTX.is_draft_model = True
         if self.is_draft_model_prefill:
             _EXTRA_CTX.is_draft_model_prefill = True
 
-        return self.original_model(*args, **kwargs)
+        if is_capturing:
+            logger.warning(
+                "[TREE-DIAG] model forward capture begin: role=%s tokens=%s runtime_mode=%s",
+                "draft" if self.is_draft_model else "target",
+                getattr(forward_context, "num_tokens", None),
+                forward_context.cudagraph_runtime_mode,
+            )
+        try:
+            output = self.original_model(*args, **kwargs)
+        except Exception:
+            if is_capturing:
+                logger.exception(
+                    "[TREE-DIAG] model forward capture failed: role=%s tokens=%s "
+                    "runtime_mode=%s",
+                    "draft" if self.is_draft_model else "target",
+                    getattr(forward_context, "num_tokens", None),
+                    forward_context.cudagraph_runtime_mode,
+                )
+            raise
+        if is_capturing:
+            logger.warning(
+                "[TREE-DIAG] model forward capture done: role=%s tokens=%s runtime_mode=%s",
+                "draft" if self.is_draft_model else "target",
+                getattr(forward_context, "num_tokens", None),
+                forward_context.cudagraph_runtime_mode,
+            )
+        return output
 
     def get_original_model(self):
         return self.original_model

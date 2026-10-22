@@ -58,7 +58,7 @@ from vllm_ascend.core.profiling_chunk_predictor import (
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import lmhead_tp_enable, set_potential_max_tokens, vllm_version_is
 from vllm_ascend.worker.utils import disable_compilation
-from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, tree_diag_once
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
@@ -81,6 +81,7 @@ from vllm_ascend.worker.v2.spec_decode import (
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
+from vllm_ascend.worker.v2.tree_model_diag import TreeModelRecorder
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
 if vllm_version_is("0.28.0"):
@@ -98,8 +99,12 @@ class NPUModelRunner(GPUModelRunner):
     execute_model_state: ExecuteModelState | None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self._tree_diag_seen = set()
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        # Temporary opt-in diagnostic in the tree builder's extensible params.
+        diag_dir = self.ascend_config.tree_spec_config.params.get("model_diag_dir")
+        self._tree_model_recorder = TreeModelRecorder(diag_dir) if diag_dir else None
         self.kvpp = KVPPRuntime()
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
@@ -191,19 +196,30 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=True,
         )
 
-        # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
-        # nodes, so the verify query is budget+1 rather than spec_depth+1.
-        if dflash_tree_spec_enabled(vllm_config):
-            self.decode_query_len = 1 + get_ascend_config().tree_spec_config.budget
-        else:
-            self.decode_query_len = self.num_speculative_steps + 1
+        # Initialize before load_model for Ascend buffer allocation. The setter
+        # also preserves the tree width when upstream load_model assigns it again.
+        self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
+
+    @property
+    def decode_query_len(self) -> int:
+        return self._decode_query_len
+
+    @decode_query_len.setter
+    def decode_query_len(self, value: int) -> None:
+        # Upstream load_model resets this to draft depth + bonus tokens before
+        # allocating the sampler and structured-output buffers. Tree verification
+        # instead packs the root plus every draft node. Enforce that width here,
+        # before those allocations, as well as for graph capture and dispatch.
+        # Keep num_speculative_steps unchanged: it still controls draft depth.
+        if dflash_tree_spec_enabled(self.vllm_config):
+            value = self.ascend_config.tree_spec_config.budget + 1
+        self._decode_query_len = value
 
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
@@ -274,6 +290,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         super().load_model(load_dummy_weights, *args, **kwargs)
+        if self._tree_model_recorder is not None:
+            self._tree_model_recorder.install_layer_taps(self)
         if dflash_tree_spec_enabled(self.vllm_config) and isinstance(
             self.speculator, AscendTreeSpeculator
         ):
@@ -328,6 +346,8 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
+        if self._tree_model_recorder is not None and not dummy_run and not is_profile:
+            self._tree_model_recorder.before_forward(self, scheduler_output)
         output = super().execute_model(
             scheduler_output,
             intermediate_tensors=intermediate_tensors,
@@ -339,6 +359,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.model_state.kvpp_is_dummy_run = False
         self.kvpp.complete_forward()
+
+        if self._tree_model_recorder is not None and not dummy_run and not is_profile:
+            self._tree_model_recorder.record(self, scheduler_output)
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
@@ -388,6 +411,28 @@ class NPUModelRunner(GPUModelRunner):
         idx_mapping_np = batch_req_state.idx_mapping_np
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
         num_reqs = len(req_ids)
+
+        if scheduler_output.scheduled_spec_decode_tokens:
+            draft_counts = [
+                len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+                for req_id in req_ids
+            ]
+            tree_diag_once(
+                self._tree_diag_seen,
+                (
+                    "prepare",
+                    tuple(int(x) for x in num_scheduled_tokens_np.tolist()),
+                    tuple(draft_counts),
+                    batch_desc.cg_mode,
+                ),
+                "prepare spec batch: scheduled=%s draft_counts=%s "
+                "real_tokens=%s padded_tokens=%s batch_desc=%s",
+                [int(x) for x in num_scheduled_tokens_np.tolist()],
+                draft_counts,
+                num_tokens,
+                num_tokens_after_padding,
+                batch_desc,
+            )
 
         num_valid_tokens = num_scheduled_tokens_np
         if scheduler_output.scheduled_spec_decode_tokens:
@@ -837,6 +882,21 @@ class NPUModelRunner(GPUModelRunner):
             path_node_ids,
             num_sampled,
             is_tree_row=tree_row_mask(num_sampled, num_rejected),
+        )
+        tree_diag_once(
+            self._tree_diag_seen,
+            (
+                "state",
+                tuple(path_node_ids.shape),
+                tuple(num_sampled.shape),
+                tuple(num_rejected.shape),
+            ),
+            "state rollback staged: path_shape=%s sampled_shape=%s rejected_shape=%s "
+            "device=%s",
+            tuple(path_node_ids.shape),
+            tuple(num_sampled.shape),
+            tuple(num_rejected.shape),
+            path_node_ids.device,
         )
 
     def _copy_num_computed_tokens_to_cpu(self):
