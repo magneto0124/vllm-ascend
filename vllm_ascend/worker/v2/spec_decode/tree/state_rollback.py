@@ -473,9 +473,8 @@ def compute_tree_conv_rows(
     rows = tree_parents.shape[0]
     slots = tree_parents.shape[1] + 1
     device = tree_parents.device
-    if row_widths is None:
-        row_widths = torch.full((rows,), slots, dtype=torch.long, device=device)
-    else:
+    full_width = row_widths is None
+    if row_widths is not None:
         # Validated before the device transfer (a CPU tensor here), because a
         # device-side ``bool(...)`` would synchronize the stream.
         row_widths = row_widths.reshape(-1)
@@ -485,7 +484,9 @@ def compute_tree_conv_rows(
             raise ValueError(
                 f"every draft-tree row verifies between 1 and {slots} tokens, got {row_widths.tolist()}."
             )
-        row_widths = row_widths.to(device=device, dtype=torch.long)
+        full_width = row_widths.device.type == "cpu" and bool(torch.all(row_widths == slots))
+        if not full_width:
+            row_widths = row_widths.to(device=device, dtype=torch.long)
     parents, depths = tree_node_parents_depths(tree_parents, tree_num_nodes, slots)
     # Walk-up ancestors: column ``k`` is the ``k + 1``-th ancestor. ``clamp``
     # keeps the gather in range where an ancestor is missing; those entries are
@@ -500,12 +501,21 @@ def compute_tree_conv_rows(
     # ``R * slots`` capacity -- so the result keeps its shape and the cost does
     # not depend on the widths -- and only the first ``row_widths.sum()`` rows
     # hold windows the layer reads.
-    starts = torch.cumsum(row_widths, dim=0) - row_widths
-    ends = starts + row_widths
     positions = torch.arange(rows * slots, device=device)
-    token_rows = (positions.unsqueeze(1) >= ends.unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
-    token_cols = (positions - starts[token_rows]).clamp(max=slots - 1)
-    node_row_table = node_row_offset + starts.unsqueeze(1) + torch.arange(slots, device=device).unsqueeze(0)
+    if full_width:
+        # Fixed-width decode has no row packing: token order already matches
+        # row-major tree order. Keep this path to a pair of integer divisions
+        # instead of the cumulative scan and row search used for short rows.
+        token_rows = positions // slots
+        token_cols = positions % slots
+        node_row_table = node_row_offset + torch.arange(rows, device=device).unsqueeze(1) * slots
+        node_row_table = node_row_table + torch.arange(slots, device=device).unsqueeze(0)
+    else:
+        starts = torch.cumsum(row_widths, dim=0) - row_widths
+        ends = starts + row_widths
+        token_rows = (positions.unsqueeze(1) >= ends.unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
+        token_cols = (positions - starts[token_rows]).clamp(max=slots - 1)
+        node_row_table = node_row_offset + starts.unsqueeze(1) + torch.arange(slots, device=device).unsqueeze(0)
 
     window_rows = _tree_conv_tap_rows(
         chain=chain[token_rows, token_cols],

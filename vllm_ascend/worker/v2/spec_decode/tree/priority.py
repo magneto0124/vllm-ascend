@@ -24,7 +24,12 @@ class PriorityTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        graph_safe: bool = False,
     ) -> TreeLayout:
+        if graph_safe:
+            raise ValueError(
+                "priority tree construction uses host-side search and cannot be captured"
+            )
         budget = self.budget
         topk = self.topk
         num_reqs, _, _ = draft_logits.shape

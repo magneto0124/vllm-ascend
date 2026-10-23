@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -39,6 +42,7 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time, tree_timer_enabled
 from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import selected_gdn_state_update_name
 from vllm_ascend.worker.v2.spec_decode.tree.treewy import treewy_ancestor_mask
 
@@ -46,6 +50,14 @@ _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
 _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE = 608 * 2
 _GDN_CUMSUM_WORKING_SET = 2**18
+logger = logging.getLogger(__name__)
+
+
+def _tree_profiled_call(segment: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if not tree_timer_enabled():
+        return fn(*args, **kwargs)
+    with tree_time(segment):
+        return fn(*args, **kwargs)
 
 
 def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
@@ -191,6 +203,14 @@ def _pack_tree_rows_to_tokens(
     packed tokens hold ``NULL_BLOCK_ID`` -- the kernel never reaches them.
     """
     rows = table.shape[0]
+    # The usual tree decode verifies every slot. Its row-major table is already
+    # token-major, so avoid launching the gather/scan sequence in this case.
+    if (
+        row_widths.device.type == "cpu"
+        and row_widths.numel() == rows
+        and bool(torch.all(row_widths == slots))
+    ):
+        return table
     widths = row_widths.to(device=table.device, dtype=torch.long).reshape(-1)
     if widths.numel() != rows:
         raise ValueError(f"got {widths.numel()} row widths for {rows} tree rows.")
@@ -325,6 +345,30 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_seqs,
             self.decode_cudagraph_max_bs,
         )
+        self._tree_state_table_graphs: dict[int, Any] = {}
+        self._tree_state_table_graph_failures: set[int] = set()
+        self.spec_tree_table_state_pages: torch.Tensor | None = None
+        self.spec_tree_table_resume_slots: torch.Tensor | None = None
+        self.spec_tree_table_prev_path: torch.Tensor | None = None
+        self.spec_tree_table_prev_num_sampled: torch.Tensor | None = None
+        if (
+            self.use_full_cuda_graph
+            and self.spec_tree_slots is not None
+            and self.spec_conv_width is not None
+            and selected_gdn_state_update_name() == "snapshot"
+        ):
+            self.spec_tree_table_state_pages = torch.empty(
+                (sequence_index_capacity, self.spec_tree_slots), dtype=torch.int32, device=device
+            )
+            self.spec_tree_table_resume_slots = torch.empty(
+                (sequence_index_capacity,), dtype=torch.int32, device=device
+            )
+            self.spec_tree_table_prev_path = torch.empty(
+                (sequence_index_capacity, self.spec_tree_slots - 1), dtype=torch.int32, device=device
+            )
+            self.spec_tree_table_prev_num_sampled = torch.empty(
+                (sequence_index_capacity,), dtype=torch.int32, device=device
+            )
 
         self.spec_sequence_masks: torch.Tensor = torch.empty(
             (sequence_index_capacity,), dtype=torch.bool, device=device
@@ -721,6 +765,186 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return window_rows, prefix_src
 
+    def _copy_tree_state_table_inputs(
+        self,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_sequence_indices: torch.Tensor,
+        prev_path_node_ids: torch.Tensor,
+        prev_num_sampled: torch.Tensor,
+    ) -> int:
+        """Refresh stable inputs used by the fixed-width state-table graph."""
+        rows = spec_sequence_indices.numel()
+        if (
+            self.spec_tree_table_state_pages is None
+            or self.spec_tree_table_resume_slots is None
+            or self.spec_tree_table_prev_path is None
+            or self.spec_tree_table_prev_num_sampled is None
+        ):
+            raise RuntimeError("snapshot tree state-table graph buffers were not allocated.")
+
+        self.spec_tree_table_state_pages[:rows].copy_(state_indices)
+        self.spec_tree_table_resume_slots[:rows].copy_(num_accepted_tokens)
+        if prev_path_node_ids.shape[0] == rows:
+            # The captured path is only used when every row in the fixed-width
+            # batch is speculative, so the sequence indices are 0..rows-1.
+            self.spec_tree_table_prev_path[:rows].copy_(prev_path_node_ids)
+            self.spec_tree_table_prev_num_sampled[:rows].copy_(prev_num_sampled)
+        else:
+            self.spec_tree_table_prev_path[:rows].copy_(
+                torch.index_select(prev_path_node_ids, 0, spec_sequence_indices)
+            )
+            self.spec_tree_table_prev_num_sampled[:rows].copy_(
+                torch.index_select(prev_num_sampled, 0, spec_sequence_indices)
+            )
+        return rows
+
+    def _compute_snapshot_tree_state_tables(self, rows: int) -> None:
+        """Write fixed-width snapshot state tables into their stable outputs."""
+        if (
+            self.spec_tree_slots is None
+            or self.spec_conv_width is None
+            or self.spec_init_state_indices is None
+            or self.spec_conv_window_rows is None
+            or self.spec_conv_prefix_src is None
+            or self.spec_tree_parents is None
+            or self.spec_tree_num_nodes is None
+            or self.spec_tree_table_state_pages is None
+            or self.spec_tree_table_resume_slots is None
+            or self.spec_tree_table_prev_path is None
+            or self.spec_tree_table_prev_num_sampled is None
+        ):
+            raise RuntimeError("snapshot tree state-table graph is missing a required buffer.")
+
+        # Lazy import: the tree spec-decode package imports this builder.
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            compute_tree_conv_rows,
+            compute_tree_init_state_indices,
+            compute_tree_prefix_source,
+        )
+
+        slots = self.spec_tree_slots
+        init_state_indices = compute_tree_init_state_indices(
+            self.spec_tree_table_state_pages[:rows],
+            self.spec_tree_table_resume_slots[:rows],
+            self.spec_tree_parents[:rows],
+            self.spec_tree_num_nodes[:rows],
+        )
+        self.spec_init_state_indices[:rows].copy_(init_state_indices)
+
+        conv_window_rows = compute_tree_conv_rows(
+            self.spec_tree_parents[:rows],
+            self.spec_tree_num_nodes[:rows],
+            self.spec_conv_width,
+            rows * (self.spec_conv_width - 1),
+        )
+        self.spec_conv_window_rows[: rows * slots].copy_(conv_window_rows)
+
+        conv_prefix_src = compute_tree_prefix_source(
+            self.spec_tree_table_prev_path[:rows],
+            self.spec_tree_table_prev_num_sampled[:rows],
+            self.spec_conv_width,
+        )
+        self.spec_conv_prefix_src[:rows].copy_(conv_prefix_src)
+
+    def _get_or_capture_snapshot_tree_state_table_graph(
+        self,
+        rows: int,
+        *,
+        capture: bool,
+    ) -> Any | None:
+        """Find a captured fixed-width table graph or capture it during warmup."""
+        graph = self._tree_state_table_graphs.get(rows)
+        if graph is not None:
+            return graph
+        if (
+            not capture
+            or rows in self._tree_state_table_graph_failures
+            or self.spec_tree_slots is None
+            or self.spec_conv_width is None
+            or not hasattr(torch, "npu")
+            or not hasattr(torch.npu, "NPUGraph")
+            or not hasattr(torch.npu, "is_current_stream_capturing")
+            or self.spec_tree_parents is None
+            or self.spec_tree_parents.device.type != "npu"
+        ):
+            return None
+
+        # This helper is called while outer model graphs are being prepared.
+        # Never attempt nested NPUGraph capture if a backend calls it from an
+        # active capture stream.
+        if torch.npu.is_current_stream_capturing():
+            return None
+
+        try:
+            from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+            from vllm.platforms import current_platform
+
+            validate_cudagraph_capturing_enabled()
+            graph_pool = current_platform.get_global_graph_pool()
+            with torch.inference_mode():
+                self._compute_snapshot_tree_state_tables(rows)
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph, pool=graph_pool):
+                    self._compute_snapshot_tree_state_tables(rows)
+            self._tree_state_table_graphs[rows] = graph
+            logger.info("Captured GDN snapshot state-table ACLGraph rows=%s", rows)
+            return graph
+        except Exception as exc:
+            self._tree_state_table_graph_failures.add(rows)
+            logger.warning(
+                "GDN snapshot state-table ACLGraph capture failed for rows=%s; "
+                "using eager table construction. %s",
+                rows,
+                exc,
+            )
+            return None
+
+    def _run_snapshot_tree_state_table_graph(
+        self,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_sequence_indices: torch.Tensor,
+        prev_path_node_ids: torch.Tensor,
+        prev_num_sampled: torch.Tensor,
+        *,
+        capture: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Refresh graph inputs and replay the fixed-width snapshot table graph."""
+        rows = spec_sequence_indices.numel()
+        # Uncaptured sizes and capture failures must not pay extra device
+        # copies on top of the eager fallback at every decode step.
+        if rows not in self._tree_state_table_graphs and (
+            not capture or rows in self._tree_state_table_graph_failures
+        ):
+            return None
+        if (
+            self.spec_tree_slots is None
+            or self.spec_init_state_indices is None
+            or self.spec_conv_window_rows is None
+            or self.spec_conv_prefix_src is None
+            or self.spec_tree_parents is None
+            or self.spec_tree_num_nodes is None
+        ):
+            return None
+        self._copy_tree_state_table_inputs(
+            state_indices,
+            num_accepted_tokens,
+            spec_sequence_indices,
+            prev_path_node_ids,
+            prev_num_sampled,
+        )
+        graph = self._get_or_capture_snapshot_tree_state_table_graph(rows, capture=capture)
+        if graph is None:
+            return None
+        graph.replay()
+        slots = self.spec_tree_slots
+        return (
+            self.spec_init_state_indices[:rows],
+            self.spec_conv_window_rows[: rows * slots],
+            self.spec_conv_prefix_src[:rows],
+        )
+
     def _count_tree_shape_stats(
         self,
         row_widths: torch.Tensor,
@@ -1079,6 +1303,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         tree_num_nodes: torch.Tensor | None = None,
         prev_path_node_ids: torch.Tensor | None = None,
         prev_num_sampled: torch.Tensor | None = None,
+        _capture_tree_state_table_graph: bool = False,
     ) -> GDNAttentionMetadata:
         m = _treat_single_token_prefills_with_state_as_decodes(common_attn_metadata)
 
@@ -1139,7 +1364,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     num_spec_decodes,
                 )
                 if self.spec_tree_slots is not None:
-                    spec_tree_parents, spec_tree_num_nodes = self._select_tree_layout(
+                    spec_tree_parents, spec_tree_num_nodes = _tree_profiled_call(
+                        "gdn_tree_layout_select",
+                        self._select_tree_layout,
                         tree_parents,
                         tree_num_nodes,
                         spec_sequence_indices,
@@ -1280,36 +1507,84 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # Tokens each speculative request verifies; a row may be shorter
             # than the tree width, see _build_tree_init_state_indices.
             spec_row_widths = query_lens_cpu[spec_sequence_masks_cpu]
-            spec_init_state_indices = self._build_tree_init_state_indices(
-                spec_state_indices_tensor,
-                num_accepted_tokens,
-                query_lens_cpu,
-                spec_sequence_masks_cpu,
-                tree_parents,
-                tree_num_nodes,
-                spec_sequence_indices,
+            full_width_snapshot_batch = (
+                self.use_full_cuda_graph
+                and self.spec_tree_slots is not None
+                and self.spec_conv_width is not None
+                and selected_gdn_state_update_name() == "snapshot"
+                and num_prefills == 0
+                and num_decodes == 0
+                and num_spec_decodes == m.num_reqs
+                and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+                and spec_row_widths.numel() == num_spec_decodes
+                and bool(torch.all(spec_row_widths == self.spec_tree_slots))
             )
-            spec_conv_window_rows, spec_conv_prefix_src = self._build_tree_conv_rows(
-                num_accepted_tokens,
-                tree_parents,
-                tree_num_nodes,
-                spec_sequence_indices,
-                prev_path_node_ids,
-                prev_num_sampled,
-                row_widths=spec_row_widths,
-            )
+            state_table_graph_outputs = None
+            if (
+                full_width_snapshot_batch
+                and (_capture_tree_state_table_graph or num_spec_decodes in self._tree_state_table_graphs)
+                and spec_state_indices_tensor is not None
+                and num_accepted_tokens is not None
+                and spec_sequence_indices is not None
+                and prev_path_node_ids is not None
+                and prev_num_sampled is not None
+            ):
+                state_table_graph_outputs = _tree_profiled_call(
+                    "gdn_state_tables_graph",
+                    self._run_snapshot_tree_state_table_graph,
+                    spec_state_indices_tensor,
+                    num_accepted_tokens,
+                    spec_sequence_indices,
+                    prev_path_node_ids,
+                    prev_num_sampled,
+                    capture=_capture_tree_state_table_graph,
+                )
+            if state_table_graph_outputs is not None:
+                (
+                    spec_init_state_indices,
+                    spec_conv_window_rows,
+                    spec_conv_prefix_src,
+                ) = state_table_graph_outputs
+            else:
+                spec_init_state_indices = _tree_profiled_call(
+                    "gdn_recurrent_state_table",
+                    self._build_tree_init_state_indices,
+                    spec_state_indices_tensor,
+                    num_accepted_tokens,
+                    query_lens_cpu,
+                    spec_sequence_masks_cpu,
+                    tree_parents,
+                    tree_num_nodes,
+                    spec_sequence_indices,
+                )
+                spec_conv_window_rows, spec_conv_prefix_src = _tree_profiled_call(
+                    "gdn_conv_state_tables",
+                    self._build_tree_conv_rows,
+                    num_accepted_tokens,
+                    tree_parents,
+                    tree_num_nodes,
+                    spec_sequence_indices,
+                    prev_path_node_ids,
+                    prev_num_sampled,
+                    row_widths=spec_row_widths,
+                )
             if spec_conv_window_rows is not None and self.spec_conv_window_rows is not None:
                 # Same packing for the state pages: the recurrent op consumes
                 # them by global token offset, like the init pages and the conv
                 # windows. The conv path keeps reading the table per row, taking
                 # each request's running page at its token start
                 # (ops/gdn.tree_causal_conv1d).
-                spec_state_indices_tensor = _pack_tree_rows_to_tokens(
-                    spec_state_indices_tensor,
-                    spec_row_widths,
-                    spec_state_indices_tensor.shape[1],
-                )
-                self._count_tree_shape_stats(
+                if not full_width_snapshot_batch:
+                    spec_state_indices_tensor = _tree_profiled_call(
+                        "gdn_state_page_pack",
+                        _pack_tree_rows_to_tokens,
+                        spec_state_indices_tensor,
+                        spec_row_widths,
+                        spec_state_indices_tensor.shape[1],
+                    )
+                _tree_profiled_call(
+                    "gdn_tree_shape_stats",
+                    self._count_tree_shape_stats,
                     spec_row_widths,
                     spec_sequence_masks_cpu,
                     spec_sequence_indices,
@@ -1446,10 +1721,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 # are never dereferenced; keep them consistent with the state
                 # table padding.
                 assert self.spec_init_state_indices is not None
-                self.spec_init_state_indices[:num_spec_decodes].copy_(
-                    spec_init_state_indices,
-                    non_blocking=True,
-                )
+                if self.spec_init_state_indices.data_ptr() != spec_init_state_indices.data_ptr():
+                    self.spec_init_state_indices[:num_spec_decodes].copy_(
+                        spec_init_state_indices,
+                        non_blocking=True,
+                    )
                 spec_init_state_indices = self.spec_init_state_indices[:spec_batch_size]
                 spec_init_state_indices[num_spec_decodes:].fill_(NULL_BLOCK_ID)
 
@@ -1460,14 +1736,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 # count and skips the rows that own no state page).
                 assert spec_conv_prefix_src is not None
                 assert self.spec_conv_window_rows is not None and self.spec_conv_prefix_src is not None
-                self.spec_conv_window_rows[: spec_conv_window_rows.size(0)].copy_(
-                    spec_conv_window_rows,
-                    non_blocking=True,
-                )
-                self.spec_conv_prefix_src[: spec_conv_prefix_src.size(0)].copy_(
-                    spec_conv_prefix_src,
-                    non_blocking=True,
-                )
+                if self.spec_conv_window_rows.data_ptr() != spec_conv_window_rows.data_ptr():
+                    self.spec_conv_window_rows[: spec_conv_window_rows.size(0)].copy_(
+                        spec_conv_window_rows,
+                        non_blocking=True,
+                    )
+                if self.spec_conv_prefix_src.data_ptr() != spec_conv_prefix_src.data_ptr():
+                    self.spec_conv_prefix_src[: spec_conv_prefix_src.size(0)].copy_(
+                        spec_conv_prefix_src,
+                        non_blocking=True,
+                    )
                 spec_conv_window_rows = self.spec_conv_window_rows[: spec_batch_size * self.spec_tree_slots]
                 spec_conv_prefix_src = self.spec_conv_prefix_src[:spec_batch_size]
 
@@ -1538,12 +1816,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> GDNAttentionMetadata:
-        """Capture the draft-tree state table inside the speculative branch.
+        """Prepare tree-aware model metadata and capture fixed-width read tables.
 
         A full graph replays the kernels recorded at capture, so the recurrent op
         has to be recorded *with* its ``init_state_indices`` input; a chain
         layout keeps the recorded kernel on its in-register carry and the
         captured page ids are never used because capture outputs are dropped.
+        Metadata preparation happens before model capture. Eligible snapshot
+        batches capture a separate table graph here, then replay it during
+        build() before the model graph consumes the stable table outputs.
         """
         if self.spec_tree_slots is None:
             return super().build_for_cudagraph_capture(common_attn_metadata)
@@ -1578,6 +1859,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             tree_num_nodes=tree_num_nodes,
             prev_path_node_ids=prev_path_node_ids,
             prev_num_sampled=prev_num_sampled,
+            _capture_tree_state_table_graph=True,
         )
 
     def _build_prefill_has_initial_state_and_causal_conv1d_meta(

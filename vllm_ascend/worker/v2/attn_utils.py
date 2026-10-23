@@ -72,6 +72,7 @@ from vllm_ascend.worker.v2.mamba_mem_stats import (
     kv_allocation_region,
     record_mamba_allocation,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time, tree_timer_enabled
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
@@ -349,7 +350,7 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
+        for attn_group_idx, attn_group in enumerate(attn_groups[i]):
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
@@ -375,16 +376,31 @@ def build_attn_metadata(
                 )
 
             if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
+                build_metadata = attn_metadata_builder.build_for_cudagraph_capture
+                build_args = (common_attn_metadata,)
+                build_kwargs = attn_metadata_extra_kwargs
             else:
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
+                build_metadata = attn_metadata_builder.build
+                build_args = ()
+                build_kwargs = {
+                    "common_prefix_len": 0,
+                    "common_attn_metadata": common_attn_metadata,
                     **attn_metadata_extra_kwargs,
+                }
+
+            # Keep normal execution untouched unless the tree timer is enabled.
+            # The per-group segment helps distinguish metadata builders in a
+            # mixed-attention model; tree_time synchronizes only while profiling.
+            if tree_timer_enabled() and not for_cudagraph_capture:
+                builder_name = type(attn_metadata_builder).__name__
+                num_layers = len(getattr(attn_group, "layer_names", ()))
+                timer_name = (
+                    f"attn_metadata_build_kv{i}_group{attn_group_idx}_{builder_name}_layers{num_layers}"
                 )
+                with tree_time(timer_name):
+                    metadata = build_metadata(*build_args, **build_kwargs)
+            else:
+                metadata = build_metadata(*build_args, **build_kwargs)
             if is_dsa_builder:
                 # Preserve sharing even if a builder replaces one of the
                 # dictionaries while constructing its metadata.

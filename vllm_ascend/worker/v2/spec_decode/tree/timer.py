@@ -17,6 +17,8 @@ TREE_TIMER_SEGMENTS: tuple[str, ...] = (
     "build_attn_mask",
     "target_fia_forward",
     "rejection_sample",
+    "gdn_state_resume_prepare",
+    "gdn_state_commit",
     "compact_kv_path",
     "compact_query_path",
     "draft_model_forward",
@@ -153,7 +155,8 @@ def print_tree_timer_report() -> None:
         meta_str = " ".join(f"{k}={v}" for k, v in sorted(_META.items()))
         lines.append(f"config: {meta_str}")
     any_data = False
-    for name in TREE_TIMER_SEGMENTS:
+    extra_segments = sorted(set(_SAMPLES) - set(TREE_TIMER_SEGMENTS))
+    for name in (*TREE_TIMER_SEGMENTS, *extra_segments):
         vals = list(_SAMPLES.get(name, []))
         if not vals:
             lines.append(f"  {name}: n=0")

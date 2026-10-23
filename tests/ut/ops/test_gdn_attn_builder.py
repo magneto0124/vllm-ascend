@@ -34,6 +34,9 @@ from vllm_ascend.ops.triton.fla.utils import (
 )
 from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     GDN_RECURRENT_MAX_VERIFY_TOKENS,
+    compute_tree_conv_rows,
+    compute_tree_init_state_indices,
+    compute_tree_prefix_source,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.treewy import treewy_ancestor_mask
 
@@ -1294,6 +1297,106 @@ def test_pack_tree_rows_to_tokens_leaves_full_rows_alone():
     )
 
     assert torch.equal(packed, table)
+    assert packed.data_ptr() == table.data_ptr()
+
+
+def test_fixed_width_tree_conv_rows_match_explicit_full_row_widths():
+    parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int32)
+    num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+
+    implicit_full_width = compute_tree_conv_rows(parents, num_nodes, width=4, node_row_offset=6)
+    explicit_full_width = compute_tree_conv_rows(
+        parents,
+        num_nodes,
+        width=4,
+        node_row_offset=6,
+        row_widths=torch.tensor([4, 4]),
+    )
+
+    torch.testing.assert_close(explicit_full_width, implicit_full_width)
+
+
+def test_snapshot_tree_state_table_graph_replay_refreshes_stable_inputs():
+    builder = object.__new__(AscendGDNAttentionMetadataBuilder)
+    builder.spec_tree_slots = 4
+    builder.spec_conv_width = 4
+    builder.spec_tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int32)
+    builder.spec_tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+    builder.spec_init_state_indices = torch.empty((2, 4), dtype=torch.int32)
+    builder.spec_conv_window_rows = torch.empty((8, 4), dtype=torch.int32)
+    builder.spec_conv_prefix_src = torch.empty((2, 3), dtype=torch.int32)
+    builder.spec_tree_table_state_pages = torch.empty((2, 4), dtype=torch.int32)
+    builder.spec_tree_table_resume_slots = torch.empty((2,), dtype=torch.int32)
+    builder.spec_tree_table_prev_path = torch.empty((2, 3), dtype=torch.int32)
+    builder.spec_tree_table_prev_num_sampled = torch.empty((2,), dtype=torch.int32)
+
+    class _CapturedTableGraph:
+        def replay(self):
+            builder._compute_snapshot_tree_state_tables(2)
+
+    builder._tree_state_table_graphs = {2: _CapturedTableGraph()}
+    state_indices = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+    resume_slots = torch.tensor([1, 3], dtype=torch.int32)
+    path_node_ids = torch.tensor([[-1, -1, -1], [1, 2, -1]], dtype=torch.int32)
+    num_sampled = torch.tensor([1, 3], dtype=torch.int32)
+    sequence_indices = torch.tensor([0, 1])
+
+    outputs = builder._run_snapshot_tree_state_table_graph(
+        state_indices,
+        resume_slots,
+        sequence_indices,
+        path_node_ids,
+        num_sampled,
+        capture=False,
+    )
+
+    assert outputs is not None
+    expected_init = compute_tree_init_state_indices(
+        state_indices,
+        resume_slots,
+        builder.spec_tree_parents,
+        builder.spec_tree_num_nodes,
+    )
+    expected_conv = compute_tree_conv_rows(
+        builder.spec_tree_parents,
+        builder.spec_tree_num_nodes,
+        width=4,
+        node_row_offset=6,
+    )
+    expected_prefix = compute_tree_prefix_source(path_node_ids, num_sampled, width=4)
+    torch.testing.assert_close(outputs[0], expected_init)
+    torch.testing.assert_close(outputs[1], expected_conv)
+    torch.testing.assert_close(outputs[2], expected_prefix)
+
+    addresses = tuple(output.data_ptr() for output in outputs)
+    first_values = tuple(output.clone() for output in outputs)
+    # Model-forward/eager/reset paths may overwrite these same buffers between
+    # table replays. Every replay must refresh all three tables, not cache their
+    # values from capture (including tree topology and request order changes).
+    for output in outputs:
+        output.fill_(-1)
+    builder.spec_tree_parents.copy_(torch.tensor([[0, 1, 2], [0, 0, 0]], dtype=torch.int32))
+    builder.spec_tree_num_nodes.copy_(torch.tensor([0, 3], dtype=torch.int32))
+    state_indices = state_indices.flip(0).contiguous() + 100
+    resume_slots = torch.tensor([4, 1], dtype=torch.int32)
+    path_node_ids = torch.tensor([[1, 2, 3], [-1, -1, -1]], dtype=torch.int32)
+    num_sampled = torch.tensor([4, 0], dtype=torch.int32)
+    second = builder._run_snapshot_tree_state_table_graph(
+        state_indices, resume_slots, sequence_indices, path_node_ids, num_sampled, capture=False
+    )
+    assert second is not None
+    assert tuple(output.data_ptr() for output in second) == addresses
+    torch.testing.assert_close(
+        second[0],
+        compute_tree_init_state_indices(
+            state_indices, resume_slots, builder.spec_tree_parents, builder.spec_tree_num_nodes
+        ),
+    )
+    torch.testing.assert_close(
+        second[1], compute_tree_conv_rows(builder.spec_tree_parents, builder.spec_tree_num_nodes, 4, 6)
+    )
+    torch.testing.assert_close(second[2], compute_tree_prefix_source(path_node_ids, num_sampled, 4))
+    assert all(not torch.equal(before, after) for before, after in zip(first_values, second))
 
 
 def test_tree_conv_rows_follow_the_tree_layout():

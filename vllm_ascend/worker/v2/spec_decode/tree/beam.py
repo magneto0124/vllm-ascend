@@ -34,6 +34,78 @@ class BeamTreeBuilder(TreeBuilder):
     def __init__(self, budget: int, topk: int, draft_model=None):
         super().__init__(budget, topk)
         self.draft_model = draft_model
+        self._scratch_reqs = 0
+        self._scratch_vocab = 0
+        self._scratch_spec = 0
+        self._scratch_frozen = False
+        self._pool_tokens = None
+        self._pool_scores = None
+        self._pool_parents = None
+        self._pool_depth = None
+        self._frontier_tokens = None
+        self._frontier_scores = None
+        self._frontier_pools = None
+        self._next_frontier_tokens = None
+        self._next_frontier_scores = None
+        self._next_frontier_pools = None
+        self._prop_temp = None
+        self._remap = None
+
+    def freeze_scratch(self) -> None:
+        """Prevent graph replay from growing beam intermediate buffers."""
+        self._scratch_frozen = True
+
+    def _ensure_scratch(
+        self,
+        num_reqs: int,
+        vocab: int,
+        spec_num: int,
+        device: torch.device,
+        *,
+        need_proposal: bool,
+    ) -> None:
+        if self._scratch_frozen:
+            return
+        k = min(self.topk, vocab)
+        pool_size = k + max(spec_num - 1, 0) * k * k
+        grows = (
+            self._pool_tokens is None
+            or num_reqs > self._scratch_reqs
+            or vocab > self._scratch_vocab
+            or spec_num > self._scratch_spec
+            or self._pool_tokens.device != device
+        )
+        if grows:
+            self._scratch_reqs = max(self._scratch_reqs, num_reqs)
+            self._scratch_vocab = max(self._scratch_vocab, vocab)
+            self._scratch_spec = max(self._scratch_spec, spec_num)
+            r = self._scratch_reqs
+            v = self._scratch_vocab
+            s = self._scratch_spec
+            k = min(self.topk, v)
+            pool_size = k + max(s - 1, 0) * k * k
+            self._pool_tokens = torch.empty((r, pool_size), dtype=torch.long, device=device)
+            self._pool_scores = torch.empty((r, pool_size), dtype=torch.float32, device=device)
+            self._pool_parents = torch.empty((r, pool_size), dtype=torch.long, device=device)
+            self._pool_depth = torch.empty((r, pool_size), dtype=torch.long, device=device)
+            self._frontier_tokens = torch.empty((r, k), dtype=torch.long, device=device)
+            self._frontier_scores = torch.empty((r, k), dtype=torch.float32, device=device)
+            self._frontier_pools = torch.empty((r, k), dtype=torch.long, device=device)
+            self._next_frontier_tokens = torch.empty((r, k), dtype=torch.long, device=device)
+            self._next_frontier_scores = torch.empty((r, k), dtype=torch.float32, device=device)
+            self._next_frontier_pools = torch.empty((r, k), dtype=torch.long, device=device)
+            self._remap = torch.empty((r, pool_size), dtype=torch.long, device=device)
+            self._prop_temp = None
+            if need_proposal:
+                self._prop_temp = torch.empty(
+                    (r, pool_size + 1, v), dtype=torch.float32, device=device
+                )
+        elif need_proposal and self._prop_temp is None:
+            self._prop_temp = torch.empty(
+                (self._scratch_reqs, self._pool_tokens.shape[1] + 1, self._scratch_vocab),
+                dtype=torch.float32,
+                device=device,
+            )
 
     def build(
         self,
@@ -43,6 +115,7 @@ class BeamTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        graph_safe: bool = False,
     ) -> TreeLayout:
         budget = self.budget
         topk = self.topk
@@ -50,32 +123,54 @@ class BeamTreeBuilder(TreeBuilder):
         num_reqs, spec_num, vocab = draft_logits.shape
         k = min(topk, vocab)
         device = draft_logits.device
+        need_proposal = proposal_logits is not None
+        self._ensure_scratch(
+            num_reqs,
+            vocab,
+            spec_num,
+            device,
+            need_proposal=need_proposal,
+        )
+        if self._pool_tokens is None:
+            raise RuntimeError("beam scratch buffers were not initialized")
+        pool_capacity = self._pool_tokens.shape[1]
+        if self._scratch_frozen and (
+            num_reqs > self._scratch_reqs
+            or vocab > self._scratch_vocab
+            or spec_num > self._scratch_spec
+        ):
+            raise ValueError("beam graph scratch capacity is smaller than the requested batch")
+        if need_proposal and self._prop_temp is None:
+            raise RuntimeError("beam proposal scratch was not initialized before graph replay")
 
-        frontier_tokens = root_token_ids.unsqueeze(1)
-        frontier_scores = torch.zeros(num_reqs, 1, dtype=torch.float32, device=device)
-        frontier_pools = torch.full((num_reqs, 1), -1, dtype=torch.long, device=device)
+        frontier_tokens = self._frontier_tokens[:num_reqs]
+        frontier_scores = self._frontier_scores[:num_reqs]
+        frontier_pools = self._frontier_pools[:num_reqs]
+        next_frontier_tokens = self._next_frontier_tokens[:num_reqs]
+        next_frontier_scores = self._next_frontier_scores[:num_reqs]
+        next_frontier_pools = self._next_frontier_pools[:num_reqs]
+        frontier_tokens[:, 0] = root_token_ids
+        frontier_scores.zero_()
+        frontier_pools.fill_(-1)
 
-        pool_tokens = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
-        pool_scores = torch.empty(num_reqs, 0, dtype=torch.float32, device=device)
-        pool_parents = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
-        pool_depth = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
+        pool_tokens = self._pool_tokens[:num_reqs]
+        pool_scores = self._pool_scores[:num_reqs]
+        pool_parents = self._pool_parents[:num_reqs]
+        pool_depth = self._pool_depth[:num_reqs]
 
         # Temp proposal indexed by root=0 and pool slot i -> i+1. Remapped later.
         # FP32 to match tree_proposal_logits; NPU IndexPut rejects BF16.
-        max_pool = spec_num * k * k
         prop_temp = None
-        if proposal_logits is not None:
-            prop_temp = torch.full(
-                (num_reqs, max_pool + 1, vocab),
-                float("-inf"),
-                dtype=torch.float32,
-                device=device,
-            )
+        if need_proposal:
+            prop_temp = self._prop_temp[:num_reqs, : pool_capacity + 1, :vocab]
+            prop_temp.fill_(float("-inf"))
 
+        pool_offset = 0
         for depth in range(spec_num):
-            batch = frontier_tokens.size(1)
+            batch = 1 if depth == 0 else k
+            frontier = frontier_tokens[:, :batch]
             step_logits = _markov_correct_logits(
-                draft_model, draft_logits[:, depth], frontier_tokens
+                draft_model, draft_logits[:, depth], frontier
             )
             if prop_temp is not None:
                 req_idx = torch.arange(num_reqs, device=device)
@@ -92,41 +187,34 @@ class BeamTreeBuilder(TreeBuilder):
             top_vals, top_ids = log_probs.topk(k, dim=-1)
             if draft_model is not None:
                 top_ids = draft_model.map_draft_to_target(top_ids)
-            candidate_scores = frontier_scores.unsqueeze(-1) + top_vals
+            candidate_scores = frontier_scores[:, :batch].unsqueeze(-1) + top_vals
             num_candidates = batch * k
+            pool_end = pool_offset + num_candidates
+            pool_tokens[:, pool_offset:pool_end] = top_ids.reshape(num_reqs, -1)
+            pool_scores[:, pool_offset:pool_end] = candidate_scores.reshape(num_reqs, -1)
+            pool_parents[:, pool_offset:pool_end] = frontier_pools[:, :batch].repeat_interleave(
+                k, dim=-1
+            )
+            pool_depth[:, pool_offset:pool_end].fill_(depth)
 
-            pool_tokens = torch.cat(
-                [pool_tokens, top_ids.reshape(num_reqs, -1)], dim=-1
-            )
-            pool_scores = torch.cat(
-                [pool_scores, candidate_scores.reshape(num_reqs, -1)], dim=-1
-            )
-            pool_parents = torch.cat(
-                [pool_parents, frontier_pools.repeat_interleave(k, dim=-1)], dim=-1
-            )
-            pool_depth = torch.cat(
-                [
-                    pool_depth,
-                    torch.full(
-                        (num_reqs, num_candidates),
-                        depth,
-                        dtype=torch.long,
-                        device=device,
-                    ),
-                ],
-                dim=-1,
-            )
-
-            keep = min(k, num_candidates)
+            keep = k
             cand_flat = candidate_scores.reshape(num_reqs, -1)
             top_ids_flat = top_ids.reshape(num_reqs, -1)
             selected = cand_flat.topk(keep, dim=-1).indices
-            frontier_tokens = torch.gather(top_ids_flat, 1, selected)
-            frontier_scores = torch.gather(cand_flat, 1, selected)
-            frontier_pools = (pool_tokens.size(-1) - num_candidates) + selected
+            next_frontier_tokens[:, :keep] = torch.gather(top_ids_flat, 1, selected)
+            next_frontier_scores[:, :keep] = torch.gather(cand_flat, 1, selected)
+            next_frontier_pools[:, :keep] = pool_offset + selected
+            frontier_tokens, next_frontier_tokens = next_frontier_tokens, frontier_tokens
+            frontier_scores, next_frontier_scores = next_frontier_scores, frontier_scores
+            frontier_pools, next_frontier_pools = next_frontier_pools, frontier_pools
+            pool_offset = pool_end
 
-        num_pool = pool_tokens.size(-1)
+        num_pool = pool_offset
         num_nodes = min(int(budget), num_pool)
+        pool_tokens = pool_tokens[:, :num_pool]
+        pool_scores = pool_scores[:, :num_pool]
+        pool_parents = pool_parents[:, :num_pool]
+        pool_depth = pool_depth[:, :num_pool]
         order = torch.argsort(pool_depth, dim=-1, stable=True)
         order = torch.gather(
             order,
@@ -140,7 +228,8 @@ class BeamTreeBuilder(TreeBuilder):
         )
         packed = order[:, :num_nodes].sort(dim=-1).values
 
-        remap = torch.zeros(num_reqs, num_pool, dtype=torch.long, device=device)
+        remap = self._remap[:num_reqs, :num_pool]
+        remap.zero_()
         node_ids = torch.arange(
             1, num_nodes + 1, dtype=torch.long, device=device
         ).unsqueeze(0)
@@ -154,7 +243,7 @@ class BeamTreeBuilder(TreeBuilder):
 
         tokens = torch.gather(pool_tokens, 1, packed)
         depths = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
-        finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+        finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes, force_torch=graph_safe)
 
         if proposal_logits is not None and prop_temp is not None:
             proposal_logits.fill_(float("-inf"))

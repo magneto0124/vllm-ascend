@@ -79,6 +79,7 @@ from vllm_ascend.worker.v2.spec_decode import (
     init_speculator,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.tree_model_diag import TreeModelRecorder
@@ -877,12 +878,15 @@ class NPUModelRunner(GPUModelRunner):
             tree_row_mask,
         )
 
-        model_state.stage_tree_resume_column(
-            compute_tree_resume_column(path_node_ids, num_sampled),
-            path_node_ids,
-            num_sampled,
-            is_tree_row=tree_row_mask(num_sampled, num_rejected),
-        )
+        # Separate from commit: KV compaction and other postprocessing run
+        # between staging the cursor and writing per-request state buffers.
+        with tree_time("gdn_state_resume_prepare"):
+            model_state.stage_tree_resume_column(
+                compute_tree_resume_column(path_node_ids, num_sampled),
+                path_node_ids,
+                num_sampled,
+                is_tree_row=tree_row_mask(num_sampled, num_rejected),
+            )
         tree_diag_once(
             self._tree_diag_seen,
             (
