@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import graph_capture
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -15,7 +16,8 @@ from vllm_ascend.worker.v2.spec_decode.tree.builder import (
     create_tree_builder,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
-from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
+from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, ensure_finalize_scratch
+from vllm_ascend.worker.v2.utils import communicator_switch, torch_cuda_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +184,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
 
         self._prefix_graphs: dict[int, Any] = {}
+        self._beam_graphs: dict[int, Any] = {}
+        # Query compaction runs between the target graph and draft execution; one graph
+        # per fixed shape, eager if the target backend changes an address.
+        self._query_path_graphs: dict[tuple[int, int, tuple[int, ...]], Any] = {}
+        self._query_path_graph_failures: set[tuple[int, int, tuple[int, ...]]] = set()
+        self._query_path_node_buffers: dict[tuple[int, int], torch.Tensor] = {}
         timer_backend = "triton" if use_tree_triton() else "torch"
         configure_tree_timer(
             enabled=bool(tree_cfg.enable_timer),
@@ -193,6 +201,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 "depth": self.num_speculative_steps,
                 "rejection_sampler": tree_cfg.rejection_sampler,
                 "enable_triton": bool(tree_cfg.enable_triton),
+                "gdn_state_update": tree_cfg.gdn_state_update,
             },
         )
 
@@ -284,12 +293,18 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 if aux_hidden_states:
                     tensors.extend(aux_hidden_states)
                 with tree_time("compact_query_path"):
-                    compact_tree_query_along_path(
+                    if not self._run_query_path_graph(
                         tensors,
                         input_batch.query_start_loc,
                         path_node_ids,
-                        linearize_positions=input_batch.positions,
-                    )
+                        input_batch.positions,
+                    ):
+                        compact_tree_query_along_path(
+                            tensors,
+                            input_batch.query_start_loc,
+                            path_node_ids,
+                            linearize_positions=input_batch.positions,
+                        )
         self._tree_finalized = False
         tokens = super().propose(
             input_batch,
@@ -310,10 +325,73 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             is_profile=is_profile,
             dp_sync=dp_sync,
         )
-        # FULL replay only runs draft forward; prefix may replay a second graph.
+        # FULL replay only runs draft forward; tree finalization has its own graph.
         if not dummy_run:
             self._finalize_tree(input_batch.num_reqs)
         return tokens
+
+    def _run_query_path_graph(self, tensors, query_start_loc, path_node_ids, positions) -> bool:
+        """Capture/replay fixed-shape accepted-path query compaction.
+
+        The graph captures the real target output buffers; a backend that supplies a
+        new address falls back to eager compaction for that step.
+        """
+        if not self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            return False
+        if not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
+            return False
+        if hasattr(torch.npu, "is_current_stream_capturing") and torch.npu.is_current_stream_capturing():
+            return False
+        rows, _ = path_node_ids.shape
+        token_count = tensors[0].shape[0]
+        path_key = (rows, path_node_ids.shape[1])
+        path_buffer = self._query_path_node_buffers.get(path_key)
+        if path_buffer is None:
+            path_buffer = torch.empty_like(path_node_ids)
+            self._query_path_node_buffers[path_key] = path_buffer
+        path_buffer.copy_(path_node_ids)
+        tensor_layout = tuple((tuple(t.shape), t.stride(), t.dtype) for t in tensors)
+        key = (
+            rows,
+            token_count,
+            tensor_layout,
+            tuple(t.data_ptr() for t in (*tensors, query_start_loc, path_buffer, positions)),
+        )
+        graph = self._query_path_graphs.get(key)
+        if graph is not None:
+            graph.replay()
+            return True
+        if key in self._query_path_graph_failures:
+            return False
+        # Capturing executes the in-place compaction once; back up live outputs for fallback.
+        backups = [tensor.clone() for tensor in tensors]
+        positions_backup = positions.clone()
+        try:
+            from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+            from vllm.platforms import current_platform
+
+            validate_cudagraph_capturing_enabled()
+            pool = current_platform.get_global_graph_pool()
+            with torch.inference_mode():
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph, pool=pool):
+                    compact_tree_query_along_path(tensors, query_start_loc, path_buffer, positions)
+            self._query_path_graphs[key] = graph
+            logger.info("Captured tree query-path ACLGraph rows=%s tokens=%s", rows, token_count)
+            # The capture itself performed this step's in-place reordering.
+            return True
+        except Exception as exc:
+            for tensor, backup in zip(tensors, backups):
+                tensor.copy_(backup)
+            positions.copy_(positions_backup)
+            self._query_path_graph_failures.add(key)
+            logger.warning(
+                "Tree query-path ACLGraph capture failed for rows=%s tokens=%s; using eager. %s",
+                rows,
+                token_count,
+                exc,
+            )
+            return False
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
@@ -331,6 +409,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
         self._capture_prefix_graphs()
+        self._capture_beam_graphs()
         if self.tree_kv_compact is not None:
             self.tree_kv_compact.capture(self._draft_capture_num_reqs())
 
@@ -429,6 +508,93 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     exc,
                 )
 
+    def _run_beam_finalize(self, num_reqs: int, *, graph_safe: bool) -> None:
+        """Project logits, apply Markov corrections and write the persistent tree.
+
+        All inputs are views refreshed before replay; intermediates stay in the graph pool.
+        """
+        num_sample = num_reqs * self.num_speculative_steps
+        hidden = self._draft_hidden_buf[self.sample_indices[:num_sample]]
+        logits = self.model.compute_draft_logits(hidden)
+        nqp = self.num_query_per_req
+        roots = self.input_buffers.input_ids[: num_reqs * nqp].view(num_reqs, nqp)[:, 0]
+        proposal = None
+        if self.tree_proposal_logits is not None:
+            proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
+        self.tree = self.tree_builder.build(
+            logits.view(num_reqs, self.num_speculative_steps, -1),
+            self._load_layout_from_buffers(num_reqs),
+            root_token_ids=roots,
+            draft_hidden=hidden.view(num_reqs, self.num_speculative_steps, -1),
+            proposal_logits=proposal,
+            graph_safe=graph_safe,
+        )
+
+    def _capture_beam_graphs(self) -> None:
+        if self.method != "beam" or self.tree_builder is None:
+            return
+        manager = self.query_cudagraph_manager
+        if manager is None or not manager.needs_capture():
+            return
+        sizes = self._draft_capture_num_reqs()
+        sizes = sorted({size for size in sizes if 0 < size <= self.max_num_reqs})
+        if not sizes or not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
+            return
+        from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+        from vllm.platforms import current_platform
+        from vllm_ascend.worker.v2.aclgraph_utils import model_capture_wrapper
+
+        # Capture only counts with draft graph descriptors; other counts use eager
+        # finalization rather than multiplying startup capture cost.
+        max_reqs = max(sizes)
+        self.tree_builder._ensure_scratch(
+            self.max_num_reqs,
+            self.vocab_size,
+            self.num_speculative_steps,
+            self.device,
+            need_proposal=self.tree_proposal_logits is not None,
+        )
+        self.tree_builder.freeze_scratch()
+        ensure_finalize_scratch(self.max_num_reqs, self.device)
+        # Startup capture has no live proposals: use valid dummy tokens and finite hidden
+        # states, including rows the last (possibly smaller) capture never touched.
+        self._draft_hidden_buf.zero_()
+        self.sample_indices.zero_()
+        self.input_buffers.input_ids[: max_reqs * self.num_query_per_req].zero_()
+        pool = current_platform.get_global_graph_pool()
+        with (
+            torch_cuda_wrapper(),
+            communicator_switch(),
+            model_capture_wrapper(self, False),
+            graph_capture(device=self.device),
+        ):
+            for num_reqs in sizes:
+                try:
+                    validate_cudagraph_capturing_enabled()
+                    with torch.inference_mode():
+                        self._run_beam_finalize(num_reqs, graph_safe=True)
+                        graph = torch.npu.NPUGraph()
+                        with torch.npu.graph(graph, pool=pool):
+                            self._run_beam_finalize(num_reqs, graph_safe=True)
+                    self._beam_graphs[num_reqs] = graph
+                    logger.info("Captured beam tree ACLGraph num_reqs=%s", num_reqs)
+                except Exception as exc:
+                    # Rank-local fallback would let one rank replay collectives while
+                    # another runs eager; fail startup under TP instead.
+                    if self.vllm_config.parallel_config.tensor_parallel_size > 1:
+                        raise RuntimeError(
+                            "Beam tree ACLGraph capture failed with tensor parallelism "
+                            f"for num_reqs={num_reqs}"
+                        ) from exc
+                    logger.warning(
+                        "Beam tree ACLGraph capture failed for num_reqs=%s; "
+                        "eager fallback for this size. %s",
+                        num_reqs,
+                        exc,
+                    )
+        # Warmup/capture wrote dummy trees. The next proposal must finalize again.
+        self._tree_finalized = False
+
     def _run_draft_forward(
         self,
         num_reqs: int,
@@ -438,7 +604,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        """Draft model forward only; prefix tree uses a separate ACLGraph."""
+        """Draft model forward only; tree finalization uses a separate ACLGraph."""
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
         with tree_time("draft_model_forward"):
@@ -457,6 +623,18 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             return
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
+        if self.method == "beam":
+            graph = self._beam_graphs.get(num_reqs)
+            with tree_time("build_draft_tree"):
+                if graph is None:
+                    self._run_beam_finalize(num_reqs, graph_safe=False)
+                else:
+                    graph.replay()
+            if graph is not None:
+                self.tree = self._load_layout_from_buffers(num_reqs)
+            self._tree_finalized = True
+            return
+
         if self.method == "prefix":
             graph = self._prefix_graphs.get(num_reqs)
             if graph is not None:
@@ -471,10 +649,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = hidden[self.sample_indices[:num_sample]]
-        if self.method == "beam":
-            logits = self.model.compute_draft_logits(sample_hidden_states)
-        else:
-            logits = self.model.compute_logits(sample_hidden_states)
+        logits = self.model.compute_logits(sample_hidden_states)
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
         nqp = self.num_query_per_req

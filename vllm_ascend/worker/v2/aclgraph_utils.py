@@ -210,8 +210,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 pcp_manager=pcp_manager,
             )
         with communicator_switch():
-            # vLLM #53869 added pcp_manager to ModelCudaGraphManager.capture on
-            # main; v0.28.0 still uses the older signature without that kwarg.
+            # pcp_manager kwarg exists on vLLM main but not in v0.28.0.
             if not vllm_version_is("0.28.0"):
                 return super().capture(
                     model,
@@ -257,10 +256,11 @@ class ModelWithContext(nn.Module):
         forward_context = get_forward_context()
         # In warmup phase, capturing=False by default.
         # when capturing, we need to set capturing=True in forward context.
-        _EXTRA_CTX.capturing = (
+        is_capturing = (
             torch.npu.is_current_stream_capturing()
             and forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
         )
+        _EXTRA_CTX.capturing = is_capturing
         if self.is_draft_model:
             _EXTRA_CTX.is_draft_model = True
         if self.is_draft_model_prefill:

@@ -34,6 +34,9 @@ from vllm_ascend.ops.triton.fla.utils import (
 )
 from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     GDN_RECURRENT_MAX_VERIFY_TOKENS,
+    compute_tree_conv_rows,
+    compute_tree_init_state_indices,
+    compute_tree_prefix_source,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.treewy import treewy_ancestor_mask
 
@@ -945,8 +948,8 @@ def test_treewy_does_not_fold_prompt_chunks_into_sampler_committed_state(monkeyp
     assert masks.tolist() == ([True, False] if mixed_spec else [False])
     assert accepted.tolist() == ([2, 1] if mixed_spec else [1])
     if method == "treewy":
-        # The final prompt chunk samples one token but has four real inputs;
-        # it must stay in prefill, not commit the root of a speculative chain.
+        # One sampled token but four real inputs: it stays in prefill and must
+        # not commit the root of a speculative chain.
         assert result_masks.tolist() == masks.tolist()
         assert result_accepted.tolist() == accepted.tolist()
     else:
@@ -1125,7 +1128,6 @@ def _make_tree_builder(slots: int = 4):
 
 
 def test_tree_verify_plan_absent_while_the_tree_fits_one_call():
-    """A tree no wider than the kernel's call width keeps the single-call path."""
     slots = GDN_RECURRENT_MAX_VERIFY_TOKENS
     builder = _make_tree_builder(slots=slots)
     state = torch.arange(2 * slots, dtype=torch.int32).reshape(2, slots)
@@ -1160,8 +1162,7 @@ def test_tree_verify_plan_splits_a_wider_tree_into_chunks():
     width = GDN_RECURRENT_MAX_VERIFY_TOKENS
     slots = 2 * width
     builder = _make_tree_builder(slots=slots)
-    # Page of a token == its packed token offset, and node ``j`` continues node
-    # ``j - 1``, so a chunk boundary reloads the page the previous chunk wrote.
+    # Page == packed token offset and node ``j`` continues ``j - 1``.
     state = torch.arange(2 * slots, dtype=torch.int32).reshape(2, slots)
     parents = state.clone()
     parents[:, 1:] = state[:, :-1]
@@ -1176,19 +1177,16 @@ def test_tree_verify_plan_splits_a_wider_tree_into_chunks():
     first, second = plan.chunks
     assert first.cu_seqlens.tolist() == [0, width, width]
     assert second.cu_seqlens.tolist() == [0, width, 0]
-    # Chunk 1 covers node 16 of row 0 (packed token offset 16) and it loads the
-    # page node 15 got in chunk 0.
+    # Chunk 1 covers node 16 of row 0, which loads the page node 15 got in chunk 0.
     assert second.token_indices[0].item() == width
     assert second.init_state_indices[0].item() == width - 1
     assert second.out_indices[0].item() == width
-    # Row 1 owns nothing in chunk 1: its cells carry no page and their op output
-    # is parked past the last verified token.
+    # Row 1 owns nothing in chunk 1: no page, output parked past the last token.
     assert second.state_indices[width].item() == -1
     assert second.out_indices[width].item() == 2 * slots + width
 
 
 def test_tree_init_state_indices_point_at_parent_slots():
-    """Every draft-tree node loads the state of its own parent slot."""
     builder = _make_tree_builder()
     state_indices = torch.tensor(
         [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
@@ -1242,10 +1240,8 @@ def test_tree_init_state_indices_pack_short_rows_token_major():
     builder = _make_tree_builder()
     state_indices = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
     num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32)
-    # Row 0 verifies two tokens (the tree search ran out of candidates, or the
-    # scheduler truncated its draft near max_model_len), row 1 the whole tree.
-    # The kernel reads the page table by global token offset, so the rows are
-    # packed back to back.
+    # Row 0 verifies two tokens (draft ran out or was truncated at max_model_len),
+    # row 1 the whole tree; the kernel reads pages by global token offset.
     query_lens_cpu = torch.tensor([2, 4])
     spec_sequence_masks_cpu = torch.tensor([True, True])
     tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.long)
@@ -1284,7 +1280,6 @@ def test_tree_init_state_indices_reject_a_width_beyond_the_tree():
 
 
 def test_pack_tree_rows_to_tokens_leaves_full_rows_alone():
-    """A batch where every row verifies the full width keeps the old layout."""
     table = torch.arange(12, dtype=torch.int32).reshape(3, 4)
 
     packed = ascend_gdn_attn_builder._pack_tree_rows_to_tokens(
@@ -1294,27 +1289,121 @@ def test_pack_tree_rows_to_tokens_leaves_full_rows_alone():
     )
 
     assert torch.equal(packed, table)
+    assert packed.data_ptr() == table.data_ptr()
+
+
+def test_fixed_width_tree_conv_rows_match_explicit_full_row_widths():
+    parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int32)
+    num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+
+    implicit_full_width = compute_tree_conv_rows(parents, num_nodes, width=4, node_row_offset=6)
+    explicit_full_width = compute_tree_conv_rows(
+        parents,
+        num_nodes,
+        width=4,
+        node_row_offset=6,
+        row_widths=torch.tensor([4, 4]),
+    )
+
+    torch.testing.assert_close(explicit_full_width, implicit_full_width)
+
+
+def test_snapshot_tree_state_table_graph_replay_refreshes_stable_inputs():
+    builder = object.__new__(AscendGDNAttentionMetadataBuilder)
+    builder.spec_tree_slots = 4
+    builder.spec_conv_width = 4
+    builder.spec_tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int32)
+    builder.spec_tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+    builder.spec_init_state_indices = torch.empty((2, 4), dtype=torch.int32)
+    builder.spec_conv_window_rows = torch.empty((8, 4), dtype=torch.int32)
+    builder.spec_conv_prefix_src = torch.empty((2, 3), dtype=torch.int32)
+    builder.spec_tree_table_state_pages = torch.empty((2, 4), dtype=torch.int32)
+    builder.spec_tree_table_resume_slots = torch.empty((2,), dtype=torch.int32)
+    builder.spec_tree_table_prev_path = torch.empty((2, 3), dtype=torch.int32)
+    builder.spec_tree_table_prev_num_sampled = torch.empty((2,), dtype=torch.int32)
+
+    class _CapturedTableGraph:
+        def replay(self):
+            builder._compute_snapshot_tree_state_tables(2)
+
+    builder._tree_state_table_graphs = {2: _CapturedTableGraph()}
+    state_indices = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+    resume_slots = torch.tensor([1, 3], dtype=torch.int32)
+    path_node_ids = torch.tensor([[-1, -1, -1], [1, 2, -1]], dtype=torch.int32)
+    num_sampled = torch.tensor([1, 3], dtype=torch.int32)
+    sequence_indices = torch.tensor([0, 1])
+
+    outputs = builder._run_snapshot_tree_state_table_graph(
+        state_indices,
+        resume_slots,
+        sequence_indices,
+        path_node_ids,
+        num_sampled,
+        capture=False,
+    )
+
+    assert outputs is not None
+    expected_init = compute_tree_init_state_indices(
+        state_indices,
+        resume_slots,
+        builder.spec_tree_parents,
+        builder.spec_tree_num_nodes,
+    )
+    expected_conv = compute_tree_conv_rows(
+        builder.spec_tree_parents,
+        builder.spec_tree_num_nodes,
+        width=4,
+        node_row_offset=6,
+    )
+    expected_prefix = compute_tree_prefix_source(path_node_ids, num_sampled, width=4)
+    torch.testing.assert_close(outputs[0], expected_init)
+    torch.testing.assert_close(outputs[1], expected_conv)
+    torch.testing.assert_close(outputs[2], expected_prefix)
+
+    addresses = tuple(output.data_ptr() for output in outputs)
+    first_values = tuple(output.clone() for output in outputs)
+    # Between replays the model-forward/eager/reset paths overwrite these buffers,
+    # so every replay must refresh all three tables rather than cache them.
+    for output in outputs:
+        output.fill_(-1)
+    builder.spec_tree_parents.copy_(torch.tensor([[0, 1, 2], [0, 0, 0]], dtype=torch.int32))
+    builder.spec_tree_num_nodes.copy_(torch.tensor([0, 3], dtype=torch.int32))
+    state_indices = state_indices.flip(0).contiguous() + 100
+    resume_slots = torch.tensor([4, 1], dtype=torch.int32)
+    path_node_ids = torch.tensor([[1, 2, 3], [-1, -1, -1]], dtype=torch.int32)
+    num_sampled = torch.tensor([4, 0], dtype=torch.int32)
+    second = builder._run_snapshot_tree_state_table_graph(
+        state_indices, resume_slots, sequence_indices, path_node_ids, num_sampled, capture=False
+    )
+    assert second is not None
+    assert tuple(output.data_ptr() for output in second) == addresses
+    torch.testing.assert_close(
+        second[0],
+        compute_tree_init_state_indices(
+            state_indices, resume_slots, builder.spec_tree_parents, builder.spec_tree_num_nodes
+        ),
+    )
+    torch.testing.assert_close(
+        second[1], compute_tree_conv_rows(builder.spec_tree_parents, builder.spec_tree_num_nodes, 4, 6)
+    )
+    torch.testing.assert_close(second[2], compute_tree_prefix_source(path_node_ids, num_sampled, 4))
+    assert all(not torch.equal(before, after) for before, after in zip(first_values, second))
 
 
 def test_tree_conv_rows_follow_the_tree_layout():
-    """The conv tap tables are sized by the spec batch and the state width."""
     builder = _make_tree_builder()
     builder.spec_conv_width = 4
     builder.spec_conv_window_rows = torch.empty((16, 4), dtype=torch.int32)
     builder.spec_conv_prefix_src = torch.empty((16, 3), dtype=torch.int32)
     tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.long)
     tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
-    # Accepted path of the previous step in the samplers' layout: entry ``k`` is
-    # the accept-walk node of depth ``k + 1`` (the root is node 0, so it never
-    # shows up) and ``-1`` an unused slot. Row 0 accepted no draft node, row 1
-    # the whole chain 0 -> 1 -> 2.
+    # Sampler path layout: entry ``k`` is the depth ``k + 1`` accept-walk node and
+    # ``-1`` an unused slot; row 0 accepted no draft node, row 1 the whole chain.
     prev_path_node_ids = torch.tensor([[-1, -1, -1], [1, 2, -1]], dtype=torch.int32)
     prev_num_sampled = torch.tensor([1, 3], dtype=torch.int32)
 
     window_rows, prefix_src = builder._build_tree_conv_rows(
-        # The resume cursor of the previous step, as compute_tree_resume_column
-        # derives it from the path above: the state after the root (row 0) and
-        # after node 2 (row 1).
+        # Resume cursor of the previous step: after the root (row 0), after node 2.
         torch.tensor([1, 3], dtype=torch.int32),
         tree_parents,
         tree_num_nodes,
@@ -1325,16 +1414,13 @@ def test_tree_conv_rows_follow_the_tree_layout():
 
     assert window_rows is not None and window_rows.shape == (2 * 4, 4)
     assert prefix_src is not None and prefix_src.shape == (2, 3)
-    # Row 0 accepted the root only, so its history is the two committed columns
-    # before the root plus the root's own node column (node_offset == rows *
-    # (width-1) == 6 -> column 3 + 0).
+    # Root-only row 0: two committed columns plus the root's node column (node_offset 6).
     assert prefix_src[0].tolist() == [1, 2, 3]
     # Row 1 accepted the whole chain 0 -> 1 -> 2, i.e. node columns 3, 4 and 5.
     assert prefix_src[1].tolist() == [3, 4, 5]
 
 
 def test_tree_conv_rows_none_without_tree_buffers():
-    """A builder that never sized tree buffers keeps the chain conv op."""
     builder = _make_builder(device=torch.device("cpu"), num_heads=32, num_speculative_tokens=3)
 
     assert builder._build_tree_conv_rows(

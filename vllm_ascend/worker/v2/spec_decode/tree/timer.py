@@ -17,6 +17,8 @@ TREE_TIMER_SEGMENTS: tuple[str, ...] = (
     "build_attn_mask",
     "target_fia_forward",
     "rejection_sample",
+    "gdn_state_resume_prepare",
+    "gdn_state_commit",
     "compact_kv_path",
     "compact_query_path",
     "draft_model_forward",
@@ -74,14 +76,7 @@ def tree_timer_begin_step() -> None:
 
 
 def tree_stat(name: str, value: float = 1.0) -> None:
-    """Count one shape observation for the exit report.
-
-    The report prints ``sum`` and ``mean`` per name, so a boolean observation
-    counts how often it held and a per-step count averages over the steps. Free
-    when the timer is disabled -- but the *caller* has to keep any device
-    synchronization (``.item()``, ``bool(...)``) behind
-    :func:`tree_timer_enabled`, because the early return here cannot undo it.
-    """
+    """Count one shape observation for the exit report; callers must keep device syncs gated."""
     if not _ENABLED:
         return
     _STAT_COUNT[name] += 1
@@ -153,7 +148,8 @@ def print_tree_timer_report() -> None:
         meta_str = " ".join(f"{k}={v}" for k, v in sorted(_META.items()))
         lines.append(f"config: {meta_str}")
     any_data = False
-    for name in TREE_TIMER_SEGMENTS:
+    extra_segments = sorted(set(_SAMPLES) - set(TREE_TIMER_SEGMENTS))
+    for name in (*TREE_TIMER_SEGMENTS, *extra_segments):
         vals = list(_SAMPLES.get(name, []))
         if not vals:
             lines.append(f"  {name}: n=0")
@@ -168,9 +164,7 @@ def print_tree_timer_report() -> None:
     if not any_data:
         lines.append("  (no samples after warmup)")
     if _STAT_COUNT:
-        # Shape counters: what the draft tree really looked like. A tree that
-        # collapsed to a chain, or whose layout no longer matches the tokens the
-        # scheduler put in the batch, is invisible in the timings above.
+        # Shape counters: a collapsed tree or layout/token mismatch is invisible in timings.
         lines.append("-- shape counters (sum=total, mean=per step) --")
         for name in sorted(_STAT_COUNT):
             n = _STAT_COUNT[name]

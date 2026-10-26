@@ -79,6 +79,7 @@ from vllm_ascend.worker.v2.spec_decode import (
     init_speculator,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
@@ -191,19 +192,28 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=True,
         )
 
-        # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
-        # nodes, so the verify query is budget+1 rather than spec_depth+1.
-        if dflash_tree_spec_enabled(vllm_config):
-            self.decode_query_len = 1 + get_ascend_config().tree_spec_config.budget
-        else:
-            self.decode_query_len = self.num_speculative_steps + 1
+        # Initialize before load_model for Ascend buffer allocation. The setter
+        # also preserves the tree width when upstream load_model assigns it again.
+        self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
+
+    @property
+    def decode_query_len(self) -> int:
+        return self._decode_query_len
+
+    @decode_query_len.setter
+    def decode_query_len(self, value: int) -> None:
+        # Upstream load_model resets this to draft depth + bonus tokens before allocating
+        # the sampler and structured-output buffers; tree verify packs root + every node
+        # instead. Keep num_speculative_steps unchanged: it still controls draft depth.
+        if dflash_tree_spec_enabled(self.vllm_config):
+            value = self.ascend_config.tree_spec_config.budget + 1
+        self._decode_query_len = value
 
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
@@ -283,8 +293,7 @@ class NPUModelRunner(GPUModelRunner):
             self.speculator.tree_kv_compact = self.tree_kv_compact
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        # State-cache accounting is only meaningful when the KV cache really has
-        # Mamba/GDN state groups; configure it before the allocation runs.
+        # State-cache accounting only matters when the KV cache has Mamba/GDN groups.
         mamba_mem_stats_config = self.ascend_config.mamba_mem_stats_config
         configure_mamba_mem_stats(
             enabled=mamba_mem_stats_config.enabled,
@@ -653,9 +662,7 @@ class NPUModelRunner(GPUModelRunner):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
-        # How many Mamba state pages live requests really hold; sampled, and a
-        # no-op unless additional_config.mamba_mem_stats_config enabled it on a
-        # model that really has GDN/Mamba state (see mamba_mem_stats).
+        # Sampled Mamba state pages; no-op unless mamba_mem_stats_config is enabled.
         record_mamba_step(block_tables, input_batch.num_reqs)
         slot_pos = getattr(input_batch, "slot_positions", None)
         positions = slot_pos if slot_pos is not None else input_batch.positions
@@ -811,18 +818,10 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         """Hand the last accepted tree node to the GDN state commit.
 
-        ``model_state.postprocess_state`` (called inside
-        ``super().postprocess_sampled``) records ``max(num_sampled, 1)`` as the
-        state slot the next step resumes from, which assumes the accepted tokens
-        are a prefix of the verified chain. Under a draft tree they are a
-        root-to-leaf path instead, so snapshot state resumes from the last
-        accepted node (see ``compute_tree_resume_column``). TreeWY uses the same
-        path to reconstruct its state into one page and normalizes that page's
-        cursor in ``postprocess_state``. The short conv also uses the staged
-        path to rebuild its committed history.
-        ``num_sampled``/``idx_mapping`` are in batch order, exactly like the
-        paths produced by the tree sampler, and ``num_rejected`` tells which of
-        those rows the tree op actually verified (see ``tree_row_mask``).
+        ``postprocess_state`` records ``max(num_sampled, 1)``, assuming a prefix chain,
+        but tree acceptance yields a root-to-leaf path, so snapshot state resumes from
+        the last accepted node. TreeWY rebuilds its page from the same path, as does
+        the short conv. ``num_rejected`` marks rows the tree op actually verified.
         """
         model_state = self.model_state
         if not hasattr(model_state, "stage_tree_resume_column"):
@@ -832,12 +831,14 @@ class NPUModelRunner(GPUModelRunner):
             tree_row_mask,
         )
 
-        model_state.stage_tree_resume_column(
-            compute_tree_resume_column(path_node_ids, num_sampled),
-            path_node_ids,
-            num_sampled,
-            is_tree_row=tree_row_mask(num_sampled, num_rejected),
-        )
+        # Separate from commit: KV compaction runs between staging and the state writes.
+        with tree_time("gdn_state_resume_prepare"):
+            model_state.stage_tree_resume_column(
+                compute_tree_resume_column(path_node_ids, num_sampled),
+                path_node_ids,
+                num_sampled,
+                is_tree_row=tree_row_mask(num_sampled, num_rejected),
+            )
 
     def _copy_num_computed_tokens_to_cpu(self):
         # npu attention backend still need to use seq_lens_cpu,

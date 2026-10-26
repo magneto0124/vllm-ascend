@@ -1,33 +1,5 @@
-"""Short-conv history hand-off between a tree step and the step before it.
-
-``gdn.tree_causal_conv1d`` re-anchors the committed history (conv-state columns
-``0 .. width - 2``) before it convolves the step's tokens, and where the history
-comes from depends on the operator that produced the *previous* step:
-
-* a step that ran the tree op left every node's activation in the node columns
-  ``width - 1 + node``, so the history has to be rebuilt from them (the "tree"
-  hand-off);
-* a step that ran the linear operator (``npu_causal_conv1d_custom`` ->
-  ``WriteBackState``: prompt chunks, rows the scheduler gave no draft tokens, the
-  first step after a prefill) already leaves the last ``width - 1`` activations of
-  the committed path in columns ``0 .. width - 2``, so the history must be left
-  alone (the "chain" hand-off). This is the invariant the op's own docstring
-  states: the prefix columns hold the linear-chain convention at all times.
-
-``compute_tree_prefix_source`` picks the hand-off from the staged sample count:
-``0`` maps the committed columns onto themselves, while ``>= 1`` is read as "the
-previous step's root is the last accepted node, one node per accepted token". A
-tree step that accepted only its root reports ``1`` with an all ``-1`` path, which
-is numerically identical to what a linear step reports, so the count the runtime
-stages decides -- not the raw sampler output. ``AscendMambaHybridModelState``
-stages ``0`` for every row whose step verified a single token (see
-``tests/ut/worker/test_tree_conv_state_handoff.py`` for that decision and for the
-regression guard on it).
-
-The tests here pin what the op has to produce for either staged value. The
-chain-shaped tree makes the contract exact -- when the parents form a chain the
-tree step has to reproduce the plain linear convolution of the same tokens, tap
-for tap -- so a wrong tap or a wrong tap order cannot cancel out.
+"""Short-conv history hand-off: the staged sample count picks whether the tree op
+keeps the committed columns or rebuilds them from the node columns.
 """
 
 import pytest
@@ -39,7 +11,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     compute_tree_prefix_source,
 )
 
-_WIDTH = 4  # conv kernel width: three committed taps plus the token itself
+_WIDTH = 4  # three committed taps plus the token itself
 _DIM = 3
 _BUDGET = 2
 _SLOTS = 1 + _BUDGET  # root plus two draft nodes
@@ -50,19 +22,12 @@ _QUERY_START_LOC = torch.tensor([0, _SLOTS], dtype=torch.int32)
 # A tree whose parents form a chain: node 1 follows the root, node 2 node 1.
 _CHAIN_PARENTS = torch.tensor([[0, 1]], dtype=torch.long)
 _CHAIN_NUM_NODES = torch.tensor([_BUDGET], dtype=torch.int32)
-# The previous step of a row that verified no draft token and sampled its own
-# bonus token. The samplers report the neutral count with an all ``-1`` path both
-# for a tree step that accepted no draft node and for a linear step (a prompt
-# chunk, a row without draft tokens) -- the two are numerically identical, which
-# is why the model state resolves the collision before staging (see the module
-# docstring).
+# Root-only tree steps and linear steps report the same count; state resolves it.
 _PREV_NO_DRAFT_PATH = torch.full((_ROWS, _BUDGET), -1, dtype=torch.int32)
-# What the model state stages for a row that verified a single token: the linear
-# operator committed it, so the committed columns are the history to keep.
+# Verified a single token: the linear operator committed it, so keep the columns.
 _PREV_CHAIN_SAMPLED = torch.tensor([0], dtype=torch.int32)
 _PREV_ONE_SAMPLED = torch.tensor([1], dtype=torch.int32)
-# Weights with a distinct value per tap and dimension, so a wrong tap or a wrong
-# tap order cannot cancel out.
+# A distinct value per tap and dimension, so a wrong tap cannot cancel out.
 _WEIGHT = torch.arange(1, _DIM * _WIDTH + 1, dtype=torch.float32).reshape(_DIM, _WIDTH) / 10
 _BIAS = torch.tensor([0.0, 0.1, -0.2])
 
@@ -70,6 +35,7 @@ _BIAS = torch.tensor([0.0, 0.1, -0.2])
 @pytest.fixture(autouse=True)
 def dim_last(monkeypatch):
     """Dim-last conv state; the tap order is layout independent."""
+
     monkeypatch.setattr(gdn, "is_conv_state_dim_first", lambda: False)
 
 
@@ -87,12 +53,7 @@ def _get_columns(state: torch.Tensor, start: int, columns: int) -> torch.Tensor:
 
 
 def _chain_reference(history: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Linear convolution of ``history + x``, taps oldest first.
-
-    ``compute_tree_conv_rows`` documents the same convention ("rows of the taps
-    (oldest first)"), and for a chain-shaped tree every node's window is exactly
-    the linear window of the concatenated sequence.
-    """
+    """Linear convolution of ``history + x``, taps oldest first."""
     sequence = torch.cat((history, x), dim=0)
     taps = sequence.unfold(0, _WIDTH, 1).transpose(1, 2)
     return torch.nn.functional.silu((taps * _WEIGHT.transpose(0, 1)).sum(dim=1) + _BIAS)
@@ -142,10 +103,8 @@ def test_chain_shaped_tree_step_keeps_the_history_left_by_a_chain_step():
 
 
 def test_chain_shaped_tree_step_rebuilds_the_history_of_a_tree_step():
-    """Control: the same tables are right when the previous step was a tree step."""
     history = torch.arange((_WIDTH - 1) * _DIM, dtype=torch.float32).reshape(_WIDTH - 1, _DIM)
-    # The previous step accepted only its root, whose activation sits in node
-    # column ``width - 1``; the two activations before it are the committed tail.
+    # Root-only step: its activation sits in node column ``width - 1``.
     previous_root = torch.full((1, _DIM), 77.0)
     x = torch.arange(_SLOTS * _DIM, dtype=torch.float32).reshape(_SLOTS, _DIM) + 100.0
     conv_state = _conv_state()
@@ -156,7 +115,6 @@ def test_chain_shaped_tree_step_rebuilds_the_history_of_a_tree_step():
 
     out = _run_tree_step(conv_state, x, prefix_src)
 
-    # The window the next root continues from ends at the previous accepted node.
     expected_history = torch.cat((history[1:], previous_root), dim=0)
     assert torch.allclose(out, _chain_reference(expected_history, x), atol=1e-6), (
         f"a tree step that accepted the root only must rebuild the history from the node columns "
@@ -176,7 +134,6 @@ def test_the_staged_count_chooses_the_hand_off():
 
 
 def test_prefix_source_after_a_tree_step_rebuilds_from_the_accepted_node():
-    """Control: the tree mapping itself must not change."""
     path = torch.tensor([[1, 2]], dtype=torch.int32)
 
     # The root only: the root's own node column becomes the newest committed one.

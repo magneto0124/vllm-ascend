@@ -1,38 +1,9 @@
-"""Accounting of the Ascend Mamba/GDN state cache: what is *really* allocated.
+"""Device memory the Ascend Mamba/GDN state cache really holds, per mode.
 
-Chain MTP and draft-tree verify (``tree_spec_config``) lay the same state out
-with different widths, and the question this module answers is how much device
-memory the Mamba group really consumes in each mode. Every number reported is
-read off a live object, never re-derived from config:
-
-* the raw per-layer state buffer the allocator handed out and the state views
-  carved out of it (``attn_utils._reshape_mamba_kv_cache``) give the real block
-  count, the real per-block stride, and the conv / ssm / padding split;
-* the real pool capacity is ``KVCacheConfig.num_blocks`` as assigned by the
-  engine, plus the byte delta of the KV allocation itself;
-* the block tables of a live step (``model_runner.prepare_attn``) give how many
-  Mamba state pages requests really hold, hence the bytes really in use.
-
-Nothing here depends on a draft tree, so a chain run and a tree run exercise the
-same recorders and the counters can be compared directly; the values differ only
-because the widened ``MambaSpec`` has more speculative blocks and wider conv
-state pages.
-
-Enable with ``additional_config.mamba_mem_stats_config`` (see
-:class:`vllm_ascend.ascend_config.MambaMemStatsConfig`); the worker configures
-the collector once, from the real KV cache groups, and the report is printed once
-at process exit (per rank). The block-table part samples one step out of
-``sample_interval`` because reading it back to the host synchronizes the device;
-the allocation part runs once, at cache init. With no Mamba group in the KV cache
-nothing is ever recorded and no report is printed, so the option is inert on
-every other model.
-
-A note on what the totals mean: an Ascend hybrid pool overlays its groups, i.e.
-one block id is owned by one group at a time. The buffer total is therefore what
-the Mamba group is *sized* for (``pool_blocks`` pages per layer, which is what
-the memory accounting reserves), while the sampled block tables say how much of
-that live requests really hold. Both are reported, so the two cannot be
-confused.
+Every number is read off a live object (the state views carved out in
+``attn_utils._reshape_mamba_kv_cache``, ``num_blocks``, the sampled block
+tables), so chain and tree runs compare directly. Enable with
+``additional_config.mamba_mem_stats_config``; inert without a Mamba group.
 """
 
 from __future__ import annotations
@@ -53,8 +24,7 @@ except ImportError:  # pragma: no cover - older vLLM without the helper
     get_kv_cache_spec_kind = None  # type: ignore[assignment]
 
 
-# Layout names of a GDN/Mamba1/Mamba2/KDA state buffer; every one of them stores
-# (conv sliding window, temporal/recurrent state) in this order.
+# State views of a GDN/Mamba1/Mamba2/KDA buffer, in (conv window, temporal state) order.
 _STATE_NAMES = ("conv", "ssm")
 
 
@@ -63,8 +33,7 @@ def _state_name(index: int, num_states: int, shape: tuple[int, ...]) -> str:
     if num_states == len(_STATE_NAMES):
         return _STATE_NAMES[index]
     if num_states == 1:
-        # A pure-SSM spec has no conv state; a short-conv-only spec has nothing
-        # else. The shape rank tells the two apart.
+        # Pure-SSM specs have no conv state, short-conv-only ones nothing else; rank tells them apart.
         return "ssm" if len(shape) == 3 else "conv"
     return f"state{index}"
 
@@ -74,8 +43,7 @@ def _is_mamba_spec(spec: Any) -> bool:
         try:
             return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
         except Exception:
-            # An unknown spec type is not a Mamba state cache; the name check
-            # below still covers an older vLLM without the kind helper.
+            # An unknown spec type is not Mamba; the name check below covers older vLLM.
             pass
     return type(spec).__name__ == "MambaSpec"
 
@@ -134,15 +102,13 @@ class MambaLayerAllocation:
 
     layer_name: str
     blocks: int
-    # Real per-block stride of the buffer: this is the padded page the allocator
-    # used, not a number recomputed from the spec.
+    # Real per-block stride the allocator produced, not one recomputed from the spec.
     page_bytes: int
     buffer_bytes: int
     views: tuple[MambaStateView, ...]
     spec_blocks: int
     block_size: int
-    # Identity of the buffer region, so layers that alias one allocation are not
-    # counted twice in the totals.
+    # Buffer region identity, so layers aliasing one allocation are counted once.
     storage_ptr: int = 0
 
     @property
@@ -168,17 +134,15 @@ class MambaLayerAllocation:
 @dataclass
 class _RuntimeTotals:
     samples: int = 0  # sampled steps
-    rows: int = 0  # request rows observed, i.e. one per request per sample
+    rows: int = 0  # request rows observed, one per request per sample
     held_sum: int = 0
     held_max: int = 0
-    # Block ids really held by the mamba groups at a sampled step, summed over
-    # all requests of that step.
+    # Block ids the mamba groups hold at a sampled step, summed over all requests.
     held_step_sum: int = 0
     held_step_max: int = 0
     bytes_in_use_sum: int = 0
     bytes_in_use_max: int = 0
-    # One entry per mamba group: (row width of its block table, bytes one block id
-    # of that group really spans across its layers). Filled by the first sample.
+    # Per mamba group: (block-table row width, bytes one block id spans across its layers).
     group_shapes: tuple[tuple[int, int], ...] = ()
 
     def observe(self, held: int, nbytes: int) -> None:
@@ -201,8 +165,7 @@ _STEP = 0
 _SPEC_LABEL: str = ""
 _ENABLED = False
 _INTERVAL = 50
-# Mamba KV cache groups of this engine: group id -> its layer names. Empty when
-# the model has no Mamba/GDN state, which is what makes the option inert there.
+# Mamba KV cache groups of this engine (group id -> layer names); empty without Mamba state.
 _GROUPS: dict[int, tuple[str, ...]] = {}
 _REGISTERED = False
 
@@ -222,12 +185,7 @@ def configure_mamba_mem_stats(
     sample_interval: int = 50,
     mamba_groups: dict[int, tuple[str, ...]] | None = None,
 ) -> None:
-    """Turn the collector on/off from ``additional_config.mamba_mem_stats_config``.
-
-    Called by the v2 worker with the real KV cache groups, so a model without
-    Mamba/GDN state never collects anything: the request is logged as inert and
-    the switch stays off.
-    """
+    """Turn the collector on/off; inert when the model has no Mamba/GDN state group."""
     global _ENABLED, _INTERVAL, _GROUPS, _REGISTERED
     _GROUPS = dict(mamba_groups or {})
     _INTERVAL = max(1, int(sample_interval))
@@ -287,10 +245,8 @@ def record_mamba_allocation(
 ) -> None:
     """Record one really-allocated state buffer and the views carved out of it.
 
-    ``raw_cache`` is the layer's raw buffer as the allocator produced it and
-    ``state_views`` are the conv/ssm views created from it, so every value below
-    is read off the live objects. Dimensions that do not describe an accounted
-    layout are skipped rather than guessed.
+    ``raw_cache`` and ``state_views`` are live objects, so no value is re-derived
+    from config; unaccountable dimensions are skipped rather than guessed.
     """
     if not _ENABLED:
         return
@@ -354,21 +310,16 @@ def record_mamba_step(
 ) -> None:
     """Record how many Mamba state pages the live requests really hold.
 
-    Reads a copy of the mamba group's block table rows back to the host, so it
-    runs one step out of ``configure_mamba_mem_stats(sample_interval=...)`` only.
-    Block id ``0`` is vLLM's null block, hence counting non-zero entries counts
-    the state pages a request really owns.
+    Runs one step out of ``sample_interval``; block id ``0`` is vLLM's null block.
     """
     if not _ENABLED or num_reqs <= 0:
         return
     global _STEP
     _STEP += 1
-    # Sample the first step as well, so a run shorter than the interval still
-    # reports what the live block tables held.
+    # Sample the first step too, so a run shorter than the interval still reports.
     if (_STEP - 1) % _INTERVAL:
         return
-    # Per request, summed over every mamba group: the pages it holds and the
-    # bytes those pages really span.
+    # Per request, summed over every mamba group: pages held and the bytes they span.
     held_per_row: list[int] | None = None
     bytes_per_row: list[int] | None = None
     group_shapes: list[tuple[int, int]] = []
@@ -381,8 +332,7 @@ def record_mamba_step(
             continue
         group_bytes = _group_bytes_per_block_id(group_id)
         group_shapes.append((int(table.shape[1]), group_bytes))
-        # One small device-to-host copy per sampled step; `.tolist()` keeps it to
-        # a single synchronization for the whole row block.
+        # One device-to-host copy per sampled step; ``.tolist()`` keeps it a single sync.
         held = (table[:rows] != 0).sum(dim=1).to("cpu").tolist()
         if held_per_row is None:
             held_per_row = [0] * rows

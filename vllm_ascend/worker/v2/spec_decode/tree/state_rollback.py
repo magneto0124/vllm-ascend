@@ -1,73 +1,34 @@
 """GDN state rollback for draft-tree speculative decoding.
 
-``tree_spec_config`` verifies a draft *tree*: the target model runs
-``1 + budget`` tokens per request (the already-accepted root plus ``budget``
-non-root nodes) and acceptance walks one root-to-leaf path through them. GDN
-caches one recurrent state per page, so speculative verification needs an
-explicit state-update strategy instead of assuming a linear MTP chain:
+The target verifies ``1 + budget`` tokens per request (accepted root plus ``budget``
+nodes) and acceptance walks one root-to-leaf path, so GDN's one-state-per-page layout
+needs an explicit strategy picked by ``tree_spec_config.gdn_state_update``: ``snapshot``
+keeps a state per verified node and resumes from the last accepted one; ``treewy``
+(:mod:`treewy`) keeps the committed page and rebuilds the accepted state from
+pseudo-values.
 
-* ``snapshot`` stores the recurrent state after each verified node. Node ``j``
-  starts from its parent's page; after sampling, the next step resumes from the
-  last accepted node, as computed by :func:`compute_tree_resume_column`;
-* ``treewy`` keeps only the committed recurrent page, stores TreeWY
-  pseudo-values during verification, then reconstructs and writes the accepted
-  state after sampling. Its implementation is in :mod:`treewy`.
-
-The verify width and short-conv activation capacity (``1 + budget``) are what
-``vllm_ascend.worker.v2.attn_utils.get_kv_cache_spec`` widens ``MambaSpec`` to and
-what ``AscendGDNAttentionMetadataBuilder`` sizes its spec buffers by. Recurrent
-state capacity is independent: it is ``1 + budget`` for snapshots and one page
-for TreeWY.
-
-Only the Qwen GDN path (``MambaAttentionBackendEnum.GDN_ATTN``) is wired up so
-far; :func:`validate_tree_state_slots` rejects a draft tree on any other state
-backend (KDA, Mamba1/2, short-conv, pure linear attention) instead of silently
-serving stale states.
-
-``tree_spec_config.gdn_state_update`` selects *how* the state follows the tree;
-``"snapshot"`` is the default. The setting is read, and validated, on this GDN
-path only, so it stays inert for any other state backend -- see
-:data:`GDN_STATE_UPDATE_METHODS` and :func:`validate_tree_state_slots`.
-
-TreeWY currently uses the PyTorch tensor implementation as its Ascend execution
-path. A fused Ascend operator and NPU performance validation remain follow-up
-work.
-
-The kernel side is tree-agnostic: :func:`compute_tree_init_state_indices` turns
-the ``[R, slots]`` page table plus the tree's parent ids into a per-token table
-of *page ids to load the initial state from*, which the recurrent op consumes
-through its optional ``init_state_indices`` input. Node ``t`` therefore loads
-its parent's page and writes its own, both indexed by the same slot table.
+Verify width and short-conv capacity (``1 + budget``) are what
+``attn_utils.get_kv_cache_spec`` widens ``MambaSpec`` to; recurrent capacity is sized
+separately (``1 + budget`` for snapshots, one page for TreeWY). Only the Qwen GDN
+backend is wired up -- :func:`validate_tree_state_slots` rejects a tree elsewhere
+instead of serving stale states -- and TreeWY still runs as PyTorch tensors on Ascend.
 """
 
 from dataclasses import dataclass, replace
 
 import torch
 
-# MAX_MTP in
-# csrc/attention/recurrent_gated_delta_rule/op_kernel/recurrent_gated_delta_rule.h
-# The kernel returns without touching the state once the per-request sequence
-# length exceeds it, i.e. the state silently goes stale, so a single call can
-# verify at most this many tokens (root + nodes) per request. The draft tree
-# itself may be wider: :func:`compute_tree_verify_plan` cuts it into chunks of
-# this width and chains the chunks through the state pages.
+# MAX_MTP in csrc/attention/recurrent_gated_delta_rule/op_kernel/recurrent_gated_delta_rule.h.
+# At or above it the kernel returns without touching state (silently stale), so wider
+# trees are verified in chunks -- see :func:`compute_tree_verify_plan`.
 GDN_RECURRENT_MAX_VERIFY_TOKENS = 16
 
 
 @dataclass(frozen=True)
 class GdnStateUpdateMethod:
-    """What a ``tree_spec_config.gdn_state_update`` method provides.
+    """Capabilities of one ``tree_spec_config.gdn_state_update`` method.
 
-    ``state_init``: the recurrent state of tree node ``j`` is loaded from its
-    parent's slot through the optional ``init_state_indices`` input of
-    ``npu_recurrent_gated_delta_rule``
-    (csrc/attention/recurrent_gated_delta_rule).
-
-    ``conv``: the short-conv half follows the tree end to end -- the tree walk
-    (:func:`compute_tree_conv_rows`), the widened state page that keeps this
-    step's node activations and the history re-anchored on the node the sampler
-    accepted (:func:`compute_tree_prefix_source`, applied by
-    ``ops/gdn.tree_causal_conv1d``, sized by ``_widen_mamba_spec_for_tree``).
+    ``state_init``: a node loads its parent page; ``conv``: the short-conv half follows the tree.
     """
 
     state_init: bool
@@ -78,11 +39,8 @@ class GdnStateUpdateMethod:
     implemented: bool = True
 
 
-# ``tree_spec_config.gdn_state_update`` is read on the GDN path only, so the
-# setting stays inert for every other state backend.
-#
-# A new method has to define its recurrent layout, provide the verify/commit
-# path consumed by the attention metadata, and preserve the short-conv history.
+# Read on the GDN path only, so the setting stays inert for every other state backend.
+# A new method must define its recurrent layout, verify/commit path and short-conv history.
 GDN_STATE_UPDATE_METHODS: dict[str, GdnStateUpdateMethod] = {
     "snapshot": GdnStateUpdateMethod(
         state_init=True,
@@ -110,9 +68,7 @@ DEFAULT_GDN_STATE_UPDATE = "snapshot"
 def selected_gdn_state_update_name() -> str:
     """Name of the draft-tree GDN state update method from ``tree_spec_config``.
 
-    The name is resolved here instead of in ``TreeSpecConfig`` because the setting
-    only means something for GDN state backends: a model that does not use GDN
-    never reaches this function, so an unknown value cannot fail there.
+    Resolved here, not in ``TreeSpecConfig``, so a non-GDN model never sees an unknown value.
     """
     from vllm_ascend.ascend_config import get_ascend_config
 
@@ -135,35 +91,27 @@ def selected_gdn_state_update_method() -> GdnStateUpdateMethod:
 
 
 def tree_verify_slot_count(vllm_config) -> int | None:
-    """Number of tokens the target verifies per request under a draft tree.
+    """Tokens the target verifies per request under a draft tree, or ``None`` when idle.
 
-    Returns ``None`` when no draft tree is active, i.e. the caller must keep the
-    linear-chain layout. This is ``1 + budget`` for every state update method;
-    it is deliberately independent of the recurrent-state and conv-cache layouts.
+    ``1 + budget`` for both methods, independent of the recurrent and conv-cache layouts.
     """
     from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
     if not getattr(vllm_config, "use_v2_model_runner", False):
-        # Only the v2 model runner hosts the tree; a leftover tree config must
-        # not change the state layout of the linear MTP path.
+        # Only the v2 runner hosts the tree; a leftover config must not change the linear MTP layout.
         return None
-    # ``dflash_tree_spec_enabled`` is the shared gate of the whole tree path --
-    # it only reads ``tree_spec_config.enabled`` and covers the dspark (beam /
-    # PCTree) host as well; the name is historical. Matching it keeps the state
-    # width aligned with the runner's verify width (``1 + budget``).
+    # Shared gate of the whole tree path (historical name; it also covers the dspark
+    # host), which keeps the state width aligned with the runner's verify width.
     if not dflash_tree_spec_enabled(vllm_config):
         return None
     budget = get_ascend_config().tree_spec_config.budget
     if budget is None:
         return None
     if getattr(getattr(vllm_config, "cache_config", None), "mamba_cache_mode", None) == "align":
-        # The align pre-copy kernel migrates the running state page and shifts
-        # its short-conv window by ``num_accepted_tokens - 1``. A draft tree
-        # cannot express that: the cursor is a node id and a node's window is
-        # its own root-to-node chain instead of the previous batch entry, so the
-        # shifted window would silently corrupt the conv history. Recurrent-state
-        # capacity is handled separately by the selected GDN update method.
+        # The align pre-copy shifts the short-conv window by num_accepted_tokens - 1; a
+        # tree cursor is a node id with its own root-to-node window, so the shifted
+        # window would silently corrupt the conv history.
         raise NotImplementedError(
             "tree_spec_config is not supported with mamba_cache_mode='align' "
             "yet; the align pre-copy shift of the short-conv state has no "
@@ -179,12 +127,10 @@ def tree_conv_slot_count(vllm_config) -> int | None:
 
 
 def tree_recurrent_state_slot_count(vllm_config) -> int | None:
-    """Number of recurrent-state slots required by the selected GDN method.
+    """Recurrent-state slots the selected GDN method needs.
 
-    ``snapshot`` stores a state for every verified node. TreeWY uses one page
-    for the committed state and reconstructs the accepted state after sampling.
-    Keep this separate from :func:`tree_verify_slot_count`, which remains the
-    tree's query width for both methods.
+    ``snapshot`` stores one page per verified node; TreeWY keeps one committed page.
+    Separate from :func:`tree_verify_slot_count`, which stays the query width.
     """
     verify_slots = tree_verify_slot_count(vllm_config)
     if verify_slots is None:
@@ -201,11 +147,7 @@ def tree_state_slot_count(vllm_config) -> int | None:
 def validate_tree_state_slots(slots: int, mamba_type) -> None:
     """Reject draft trees that the current state path cannot serve yet.
 
-    A tree wider than the recurrent kernel's per-call width is *not* rejected:
-    :func:`compute_tree_verify_plan` splits the verify into
-    :data:`GDN_RECURRENT_MAX_VERIFY_TOKENS`-wide chunks of node columns and the
-    chunks are chained through the state pages, so ``slots`` is only bounded by
-    the state memory the layout allocates.
+    Wider trees are fine: :func:`compute_tree_verify_plan` chunks them through the state pages.
     """
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -217,10 +159,8 @@ def validate_tree_state_slots(slots: int, mamba_type) -> None:
             "support draft-tree state rollback yet; only GDN_ATTN (Qwen GDN) is "
             "wired up. Disable tree_spec_config for this model."
         )
-    # Only now, with a GDN state backend in hand, does
-    # ``tree_spec_config.gdn_state_update`` mean anything: an unknown method, or a
-    # method that does not carry one half of the state across the tree, is refused
-    # here -- never for a model that does not use GDN.
+    # Only with a GDN backend does gdn_state_update mean anything: unknown or
+    # half-carrying methods are refused here, never for a model that does not use GDN.
     method_name = selected_gdn_state_update_name()
     method = GDN_STATE_UPDATE_METHODS[method_name]
     if not method.implemented:
@@ -254,11 +194,8 @@ def tree_conv_width(
 ) -> int | None:
     """Short-conv kernel width behind a GDN conv-state shape.
 
-    The conv state is ``(width - 1 + num_spec) x conv_dim`` and the conv
-    dimension (``2 * key_dim + value_dim``) is orders of magnitude larger than
-    the state length, so the smaller side of the 2-D state shape is the length
-    to undo the speculation width on. Returns ``None`` for layers without a
-    short conv (Mamba2, KDA) or an unexpected shape.
+    The state is ``(width - 1 + num_spec) x conv_dim`` with ``conv_dim`` far larger, so
+    the smaller side is the length. ``None`` for layers without a short conv.
     """
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -279,15 +216,11 @@ def compute_tree_resume_column(
     path_node_ids: torch.Tensor,
     num_sampled: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the state slot the next step must resume from, as an int32 tensor.
+    """State slot the next step must resume from, as an int32 tensor.
 
-    ``path_node_ids[req, k]`` is the k-th accepted draft node of the tree walk
-    (``-1`` past the accepted path, see ``greedy_tree_reject`` /
-    ``block_tree_reject``) and ``num_sampled`` counts accepted tokens including
-    the trailing resample, so the last accepted *node* sits at index
-    ``num_sampled - 2``. ``num_sampled == 1`` (no accepted draft, e.g. chunked
-    prefill) keeps the root slot, which matches the linear-chain neutral value
-    ``num_accepted_tokens = 1``.
+    ``num_sampled`` counts accepted tokens including the trailing resample, so the last
+    accepted node is ``path_node_ids[:, num_sampled - 2]``; ``num_sampled == 1`` (no
+    accepted draft) keeps the root slot, matching ``num_accepted_tokens = 1``.
     """
     sampled = num_sampled.to(torch.long)
     last_index = (sampled - 2).clamp(min=0).unsqueeze(1)
@@ -302,15 +235,8 @@ def tree_row_mask(
 ) -> torch.Tensor:
     """Rows of the batch whose step ran the tree op, in batch order, as a bool.
 
-    ``num_sampled`` alone cannot tell the two rows apart that both report ``1``
-    with an all ``-1`` path: a tree step that accepted the root only, and a row
-    the scheduler gave no draft token (which the linear operator commits). They
-    differ in how many tokens were verified: the tree op handles every row that
-    checked more than its own token, while a single-token row keeps the
-    committed short-conv history the linear operator left in place. The samplers
-    set ``num_rejected = num_logits - num_sampled``
-    (see ``spec_decode/tree/rejection_sampler.py``), so the sum is exactly the
-    number of verified tokens and needs no extra tensor from the sampler.
+    ``num_sampled`` alone cannot separate a root-only tree step from a row with no draft;
+    the samplers set ``num_rejected = num_logits - num_sampled``, so the sum is the verified count.
     """
     return (num_sampled + num_rejected) > 1
 
@@ -321,30 +247,11 @@ def compute_tree_init_state_indices(
     tree_parents: torch.Tensor,
     tree_num_nodes: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-token state page the recurrent kernel must load its initial state from.
+    """Per-token state page the recurrent kernel loads its initial state from.
 
-    Args:
-        state_indices: ``[R, slots]`` state pages written by this step, column
-            ``j`` holding tree node ``j``'s state (``j == 0`` is the root, whose
-            page carries the committed prefix state).
-        num_accepted_tokens: ``[R]`` resume cursor of the *previous* step, i.e.
-            the accepted node id plus one; ``slot = num_accepted - 1`` is the
-            page holding the state the next token continues from.
-        tree_parents: ``[R, budget]`` parent node id of node ``slot + 1``
-            (``0`` = root), straight from the tree layout.
-        tree_num_nodes: ``[R]`` number of non-root nodes; ``0`` marks a row that
-            was folded in from a prompt chunk rather than built as a tree.
-
-    Returns:
-        ``[R, slots]`` int32 page ids, in the same request/column order as
-        ``state_indices``. The caller packs them token-major, because a row may
-        verify fewer than ``slots`` tokens: see
-        ``gdn_attn_builder._pack_tree_rows_to_tokens``.
-
-    A row folded in from a prompt chunk is a linear sequence whose token ``t``
-    follows token ``t - 1``: pointing the table at that token's own page makes
-    the kernel's "parent page == previous token page" test hit and keeps its
-    in-register carry, i.e. the exact linear-chain behaviour.
+    ``[R, slots]`` int32 ids in ``state_indices`` order, packed token-major by
+    ``gdn_attn_builder._pack_tree_rows_to_tokens``. A row folded in from a prompt chunk
+    points at each token's own page, keeping the kernel's in-register linear carry.
     """
     rows, slots = state_indices.shape
     if slots - 1 > tree_parents.shape[1]:
@@ -370,19 +277,10 @@ def tree_node_parents_depths(
     tree_num_nodes: torch.Tensor,
     slots: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-node parent ids and depths of the draft tree.
+    """Per-node parent ids and depths of the draft tree, ``[R, slots]`` int64 each.
 
-    Args:
-        tree_parents: ``[R, budget]`` parent node id of node ``t + 1``, straight
-            from the tree layout (see :func:`compute_tree_init_state_indices`).
-        tree_num_nodes: ``[R]`` number of non-root nodes; ``0`` marks a row that
-            was folded in from a prompt chunk and is a linear sequence.
-        slots: number of nodes per request, i.e. ``1 + budget``.
-
-    Returns:
-        ``(parents, depths)``, both ``[R, slots]`` int64; the root's parent is
-        ``-1``. Folded rows are chained (node ``t`` follows ``t - 1``) so they
-        keep the batch-order window of the linear MTP chain.
+    The root's parent is ``-1``; folded prompt rows are chained (``t`` follows ``t - 1``)
+    so they keep the batch-order window of the linear MTP chain.
     """
     rows = tree_parents.shape[0]
     device = tree_parents.device
@@ -392,8 +290,7 @@ def tree_node_parents_depths(
     parents = torch.where(tree_num_nodes[:rows, None] > 0, parents, chain_parents.expand(rows, slots))
     depths = torch.zeros((rows, slots), dtype=torch.long, device=device)
     for node in range(1, slots):
-        # Every builder guarantees ``parent_id < node_id``, so a single forward
-        # sweep resolves the whole depth table.
+        # Builders guarantee ``parent_id < node_id``, so one forward sweep resolves depths.
         parent_of_node = parents[:, node].clamp(min=0).unsqueeze(1)
         depths[:, node] = depths.gather(1, parent_of_node).squeeze(1) + 1
     return parents, depths
@@ -410,20 +307,8 @@ def _tree_conv_tap_rows(
 ) -> torch.Tensor:
     """Rows of the ``width`` conv taps of every target, oldest tap first.
 
-    Args:
-        chain: ``[N, width - 1]`` walk-up ancestors, column ``k`` being the
-            ``k + 1``-th ancestor (parent first).
-        depths: ``[N]`` depth of every target.
-        own_rows: ``[N]`` row of the target's own activation.
-        request_ids: ``[N]`` request each target belongs to.
-        node_row_table: ``[R, slots]`` row of every node's activation.
-        history_base: ``[R]`` row of the oldest committed activation.
-
-    The rows index ``cat([committed, activations])``: the committed
-    activations of the previous steps first (oldest first), this step's
-    activations after.  A tap that falls before the root resolves to the
-    committed history, which keeps the window of shallow nodes identical to the
-    linear-chain window.
+    Rows index ``cat([committed, activations])``; a tap before the root resolves to the
+    committed history, keeping a shallow node's window identical to the linear chain.
     """
     taps = []
     for tap in range(width - 1):
@@ -444,40 +329,17 @@ def compute_tree_conv_rows(
 ) -> torch.Tensor:
     """Per-token conv window of every node of a draft tree.
 
-    Args:
-        tree_parents: ``[R, budget]`` tree parents, as above.
-        tree_num_nodes: ``[R]`` non-root node count, as above.
-        width: short-conv kernel width; the window holds ``width`` taps.
-        node_row_offset: first row of this step's activations inside the gather
-            source; the ``R * (width - 1)`` committed rows precede it.
-        row_widths: ``[R]`` tokens each request verifies, i.e. ``1 +`` its node
-            count. ``None`` assumes the full ``1 + budget`` width. A row may
-            verify fewer tokens -- the scheduler truncates a draft near
-            ``max_model_len`` and the tree search can run out of candidates --
-            and the layer reads the table by global token offset, so the rows
-            are packed back to back.
-
-    Returns:
-        ``[R * slots, width]`` rows of the taps (oldest first) consumed by
-        ``tree_causal_conv1d``, indexing
-        ``cat([committed history, this step's activations])``. Only the first
-        ``row_widths.sum()`` rows are meaningful; the layer slices the table by
-        the token count of the spec batch, and for the full width every row is
-        meaningful.
-
-    Node ``t`` convolves over its own root-to-node chain: its parent, its
-    grandparent, ... and, once the chain runs past the root, the committed
-    activations of the previous steps.  Sibling and unrelated nodes never enter
-    a node's window, which is what the linear-chain conv kernel gets wrong.
+    Returns ``[R * slots, width]`` taps (oldest first) for ``tree_causal_conv1d``, indexing
+    ``cat([committed history, this step's activations])``; only the first ``row_widths.sum()``
+    rows are read. Node ``t`` convolves over its own root-to-node chain, never its siblings --
+    which is exactly what the linear-chain conv kernel gets wrong.
     """
     rows = tree_parents.shape[0]
     slots = tree_parents.shape[1] + 1
     device = tree_parents.device
-    if row_widths is None:
-        row_widths = torch.full((rows,), slots, dtype=torch.long, device=device)
-    else:
-        # Validated before the device transfer (a CPU tensor here), because a
-        # device-side ``bool(...)`` would synchronize the stream.
+    full_width = row_widths is None
+    if row_widths is not None:
+        # Validated before the device transfer: a device-side ``bool(...)`` would sync.
         row_widths = row_widths.reshape(-1)
         if row_widths.numel() != rows:
             raise ValueError(f"row_widths must hold {rows} widths, got {row_widths.numel()}.")
@@ -485,27 +347,33 @@ def compute_tree_conv_rows(
             raise ValueError(
                 f"every draft-tree row verifies between 1 and {slots} tokens, got {row_widths.tolist()}."
             )
-        row_widths = row_widths.to(device=device, dtype=torch.long)
+        full_width = row_widths.device.type == "cpu" and bool(torch.all(row_widths == slots))
+        if not full_width:
+            row_widths = row_widths.to(device=device, dtype=torch.long)
     parents, depths = tree_node_parents_depths(tree_parents, tree_num_nodes, slots)
-    # Walk-up ancestors: column ``k`` is the ``k + 1``-th ancestor. ``clamp``
-    # keeps the gather in range where an ancestor is missing; those entries are
-    # discarded by the depth test in _tree_conv_tap_rows.
+    # Walk-up ancestors: column ``k`` is the ``k + 1``-th ancestor; ``clamp`` keeps the
+    # gather in range where an ancestor is missing (the depth test discards those).
     chain = [parents]
     for _ in range(width - 2):
         chain.append(torch.gather(parents, 1, chain[-1].clamp(min=0)))
     chain = torch.stack(chain, dim=2)
 
-    # Token-major packing: the ``p``-th token of the step is node
-    # ``p - start(r)`` of row ``r``. The tables are built on the fixed
-    # ``R * slots`` capacity -- so the result keeps its shape and the cost does
-    # not depend on the widths -- and only the first ``row_widths.sum()`` rows
-    # hold windows the layer reads.
-    starts = torch.cumsum(row_widths, dim=0) - row_widths
-    ends = starts + row_widths
+    # Token-major packing: the ``p``-th token is node ``p - start(r)`` of row ``r``. The
+    # tables keep their fixed ``R * slots`` shape, so cost is width-independent.
     positions = torch.arange(rows * slots, device=device)
-    token_rows = (positions.unsqueeze(1) >= ends.unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
-    token_cols = (positions - starts[token_rows]).clamp(max=slots - 1)
-    node_row_table = node_row_offset + starts.unsqueeze(1) + torch.arange(slots, device=device).unsqueeze(0)
+    if full_width:
+        # Fixed-width decode: token order already matches row-major tree order, so two
+        # integer divisions suffice instead of the scan and row search used for short rows.
+        token_rows = positions // slots
+        token_cols = positions % slots
+        node_row_table = node_row_offset + torch.arange(rows, device=device).unsqueeze(1) * slots
+        node_row_table = node_row_table + torch.arange(slots, device=device).unsqueeze(0)
+    else:
+        starts = torch.cumsum(row_widths, dim=0) - row_widths
+        ends = starts + row_widths
+        token_rows = (positions.unsqueeze(1) >= ends.unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
+        token_cols = (positions - starts[token_rows]).clamp(max=slots - 1)
+        node_row_table = node_row_offset + starts.unsqueeze(1) + torch.arange(slots, device=device).unsqueeze(0)
 
     window_rows = _tree_conv_tap_rows(
         chain=chain[token_rows, token_cols],
@@ -524,100 +392,35 @@ def compute_tree_prefix_source(
     num_sampled: torch.Tensor,
     width: int,
 ) -> torch.Tensor:
-    """Committed-history columns the next step has to read its window from.
+    """Committed-history columns the next step reads its conv window from.
 
-    The committed history is the ``width - 1`` activations *ending at* the token
-    the next step's root continues from, i.e. the last node the sampler accepted
-    (see :func:`compute_tree_resume_column`). ``num_sampled`` counts the accepted
-    tokens including the trailing resample, so that node sits at tree depth
-    ``num_sampled - 1``: depth ``0`` is the root, once no draft node was accepted.
-    ``path_node_ids[req, k]`` holds the accept-walk node of depth ``k + 1``, i.e.
-    the last accepted node at index ``num_sampled - 2``.
-
-    A tap of the window is therefore resolved by its tree depth ``d``:
-
-    * ``d >= 1``: the accepted node of that depth, stored by this step in node
-      column ``width - 1 + node id``;
-    * ``d == 0``: the root, node column ``width - 1`` -- its activation is this
-      step's first token, so it is *not* one of the committed columns;
-    * ``d < 0``: the activation ``-d`` tokens before the root, i.e. committed
-      column ``width - 1 + d``, which already holds it.
-
-    A row the sampler left without a path (``num_sampled == 0``, a prompt chunk
-    folded into the spec batch) maps the committed columns onto themselves: the
-    chain op already left the history its root continues from.
-
-    Args:
-        path_node_ids: ``[R, budget]`` accepted draft nodes of the tree walk.
-        num_sampled: ``[R]`` accepted token count including the resample.
-        width: short-conv kernel width.
-
-    Returns:
-        ``[R, width - 1]`` int32 conv-state columns, oldest first.
+    The window ends at the last accepted node (depth ``num_sampled - 1``), so a tap at depth
+    ``d`` resolves to node column ``width - 1 + id`` (``d >= 1``), the root's column
+    ``width - 1`` (``d == 0``) or committed column ``width - 1 + d`` (``d < 0``). Rows the
+    sampler skipped map the committed columns onto themselves.
     """
     rows = num_sampled.shape[0]
     device = num_sampled.device
-    # Depth of the last accepted node; ``-1`` marks a row the sampler skipped, so
-    # that its taps land on the committed columns themselves.
+    # Depth of the last accepted node; ``-1`` makes a skipped row's taps land on the
+    # committed columns themselves.
     last_depth = (num_sampled.to(torch.long) - 1).clamp(min=-1).unsqueeze(1)
     depth = last_depth - (width - 2) + torch.arange(width - 1, device=device).unsqueeze(0)
-    # Only the node taps (``depth >= 1``) are looked up in the path: its entry
-    # ``depth - 1`` is exactly the node of that depth. The lower entries are
+    # Path entry ``depth - 1`` is exactly the node of that depth; lower entries are
     # masked out below, so the clamped index only has to stay in range.
     node_ids = path_node_ids[:rows].to(torch.long).gather(1, (depth - 1).clamp(min=0))
     return torch.where(depth >= 1, width - 1 + node_ids, width - 1 + depth).to(torch.int32)
-
-
-# ---------------------------------------------------------------------------
-# Chunked verify of a draft tree wider than the recurrent kernel's call width
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class TreeVerifyChunk:
     """One ``npu_recurrent_gated_delta_rule`` call of a wide draft-tree verify.
 
-    The kernel verifies at most :data:`GDN_RECURRENT_MAX_VERIFY_TOKENS` tokens per
-    request in one call (its per-token row buffers are sized by that constant and
-    it *returns without touching the state* above it). A wider tree is therefore
-    cut into node columns and chained through the state pages: node ``j`` always
-    loads its parent's page through ``init_state_indices``, which the chunk that
-    verified the parent already wrote, and every tree builder guarantees
-    ``parent_id < node_id``. Chunk ``c`` owns node columns
-    ``[c * width, (c + 1) * width)`` of every row, so its tokens are always a
-    *prefix* of those columns.
-
-    The chunk's token dim is ``rows * width`` and is addressed as a padded grid:
-    row ``r`` holds the nodes it owns in cells ``[r * width, r * width + length)``
-    and the remaining cells of that row are padding. The kernel never reads
-    padding -- ``cu_seqlens`` gives every row its prefix length and a row of
-    length 0 is skipped -- so the op sees the same shapes whatever the per-row
-    widths are, which is what a full CUDA graph needs.
-
-    Attributes:
-        token_indices: ``[rows * width]`` int64, gather into the step's *packed*
-            token dim (``packed[p]`` is token ``p``, see
-            ``AscendGDNAttentionMetadataBuilder._pack_tree_rows_to_tokens``).
-        state_indices: ``[rows * width]`` int32 ssm pages of those tokens, ``-1``
-            outside the chunk. A negative index makes the kernel return without
-            updating any state (``Process``), so the sentinel turns a malformed
-            plan -- a cell outside the row's own prefix, whose state page the
-            kernel would read as the parent of a later token -- into a loud no-op
-            instead of a silent rollback of another row's state. Padding itself is
-            never read: the kernel walks each row's
-            ``[cu_seqlens[row], cu_seqlens[row + 1])`` range and only compares a
-            token with its predecessor inside that range.
-        init_state_indices: ``[rows * width]`` int32 parent pages, ``-1`` outside;
-            the first cell of every row prefix has to carry a real page, because
-            the kernel loads it unconditionally and returns on a negative one.
-        out_indices: ``[rows * width]`` int64 rows of the op output buffer the op
-            output belongs to. Padding cells point past the layer's real tokens
-            (``scratch_base``), so their undefined output cannot reach a token.
-        cu_seqlens: ``[rows + 1]`` int32 token count of every row, in the kernel's
-            ``actual_seq_lengths`` convention: entry 0 is an unused base and entry
-            ``row + 1`` is how many tokens row ``row`` verifies (the kernel
-            accumulates them into token offsets itself).
-        width: node columns this chunk covers (the kernel's call width).
+    Chunk ``c`` owns node columns ``[c * width, (c + 1) * width)`` of every row, always a
+    prefix, so node ``j`` loads the parent page an earlier chunk already wrote. The token dim
+    is a padded ``rows * width`` grid, keeping shapes fixed for full CUDA graphs, with
+    ``cu_seqlens`` bounding what the kernel reads. ``-1`` pages make the kernel return without
+    updating state, so a malformed cell is a no-op rather than a silent rollback; padding
+    cells scatter to ``scratch_base``.
     """
 
     token_indices: torch.Tensor
@@ -630,11 +433,8 @@ class TreeVerifyChunk:
 
 @dataclass(frozen=True)
 class TreeVerifyPlan:
-    """Chunked recurrent verify of one draft-tree step.
-
-    Built by :func:`compute_tree_verify_plan`; consumed by
-    ``vllm_ascend.ops.gdn`` (the chunk loop) and by
-    ``AscendGDNAttentionMetadataBuilder`` (stable buffers for graph capture).
+    """Chunked recurrent verify of one draft-tree step, built by :func:`compute_tree_verify_plan`
+    and consumed by ``vllm_ascend.ops.gdn`` and ``AscendGDNAttentionMetadataBuilder``.
     """
 
     rows: int
@@ -654,10 +454,8 @@ class TreeVerifyPlan:
     def copy_into(self, buffers: "TreeVerifyPlanBuffers") -> "TreeVerifyPlan":
         """Write this plan into stable buffers and return the matching views.
 
-        A full CUDA graph reads its inputs by address, so the chunk tensors the
-        captured ops were recorded with have to be refreshed in place on every
-        replay instead of being reallocated (the plan is rebuilt per step, the
-        buffers live in the builder).
+        A full CUDA graph reads its inputs by address, so the recorded chunk tensors are
+        refreshed in place per replay (plan rebuilt per step, buffers live in the builder).
         """
         size = self.chunk_tokens
         chunks = []
@@ -689,8 +487,7 @@ class TreeVerifyPlan:
 class TreeVerifyPlanBuffers:
     """Stable per-chunk tensors of a :class:`TreeVerifyPlan` (see ``copy_into``).
 
-    Every field carries one row per chunk, sized for the graph's row capacity, so
-    a replay can slice the live row count off the front.
+    One row per chunk, sized for the graph's row capacity so a replay takes the live count.
     """
 
     token_indices: torch.Tensor
@@ -702,10 +499,8 @@ class TreeVerifyPlanBuffers:
     def zero_lengths(self) -> None:
         """Turn every recorded chunk into a no-op call.
 
-        A replay that carries no draft tree (idle, prefill) must not run the
-        recorded chunks over the stale indices of the previous step: with every
-        row length zero the kernel skips each of them, exactly like the zeroed
-        ``spec_actual_seq_lengths`` of the linear path.
+        A replay with no draft tree (idle, prefill) must not rerun stale indices; zero row
+        lengths make the kernel skip every chunk.
         """
         self.cu_seqlens.zero_()
 
@@ -749,26 +544,9 @@ def compute_tree_verify_plan(
 ) -> TreeVerifyPlan | None:
     """Cut a draft-tree verify into recurrent-op calls of at most ``width`` tokens.
 
-    Args:
-        row_widths: ``[rows]`` verified token count of every spec row (a padded
-            graph row has width 0). The rows are the model's *tight* token order:
-            row ``r`` owns tokens ``[sum(widths[:r]), sum(widths[:r + 1]))``.
-        state_indices: ``[rows, slots]`` int32 ssm state pages, in the packed
-            token-major layout the op consumes (``reshape(-1)[p]`` is token ``p``).
-        init_state_indices: ``[rows, slots]`` int32 parent pages, same layout.
-        scratch_base: first row of the caller's output buffer that no verified
-            token uses (``num_actual_tokens``); chunk padding is scattered there.
-        width: node columns per call, i.e. the kernel's ``MAX_MTP``.
-
-    Returns:
-        ``None`` when the whole tree fits one call (the caller keeps the plain
-        single-call path), otherwise one :class:`TreeVerifyChunk` per call.
-
-    The widths are trusted, not re-validated: they come from the builder, which
-    checks every speculative row against the tree width on CPU data (a ``bool()``
-    here would sync the device once per layer per step) and passes 0 for its
-    padded graph rows. A width past ``slots`` makes the gather below fail loudly;
-    ``state_indices.shape`` may be any ``[rows, slots]`` pair.
+    Returns ``None`` when the whole tree fits one call. Widths are trusted, not re-validated:
+    the builder checks them on CPU data (a ``bool()`` here would sync the device per layer per
+    step) and passes 0 for padded graph rows.
     """
     if state_indices.dim() != 2 or init_state_indices.shape != state_indices.shape:
         raise ValueError(
@@ -793,8 +571,7 @@ def compute_tree_verify_plan(
     row_lengths = (row_ends - chunk_starts[:, None]).clamp(min=0)
     owned = cells[None, None, :] < row_lengths[:, :, None]
     tokens = token_starts[None, :, None] + chunk_starts[:, None, None] + cells[None, None, :]
-    # Padding cells are only ever gathered, never read by the kernel, so index 0
-    # keeps the gather in bounds.
+    # Padding cells are only gathered, never read, so index 0 keeps the gather in bounds.
     tokens = torch.where(owned, tokens, torch.zeros_like(tokens))
 
     flat_state = state_indices.reshape(-1)

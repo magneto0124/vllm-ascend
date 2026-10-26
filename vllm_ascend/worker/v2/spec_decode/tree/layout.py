@@ -71,11 +71,11 @@ def finalize_tree_layout(
         depths: [R, num_nodes] depths (from 1).
         parent_ids: [R, num_nodes] parent node ids (0 = root).
         num_nodes: number of non-root nodes (same for every request in the batch).
-        force_torch: skip Triton (ACLGraph capture cannot use that kernel).
+        force_torch: use the Torch implementation for graph capture.
     """
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
-    if use_tree_triton():
+    if not force_torch and use_tree_triton():
         return _finalize_tree_layout_triton(
             out, tokens, depths, parent_ids, num_nodes
         )

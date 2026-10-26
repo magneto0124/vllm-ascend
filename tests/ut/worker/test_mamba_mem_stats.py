@@ -11,7 +11,7 @@ from vllm_ascend.worker.v2.attn_utils import _reshape_mamba_kv_cache
 _NUM_SPEC = 3
 _BUDGET = 15  # tree width: slots == 1 + budget == 16
 _CONV_DIM = 8192
-_CONV_WIDTH_MINUS_1 = 3  # conv_kernel - 1, i.e. chain width == 4 at num_spec == 1
+_CONV_WIDTH_MINUS_1 = 3  # conv_kernel - 1
 _SSM_SHAPE = (32, 128, 128)
 _SSM_BYTES = 32 * 128 * 128 * 2
 _CONV_COLUMN_BYTES = _CONV_DIM * 2
@@ -19,7 +19,7 @@ _NUM_BLOCKS = 8
 # patch_mamba_config pads the mamba page up to the attention page, K + V.
 _POOL_PAGE_BYTES = 2 * 1024 * 1024
 _CHAIN_COLUMNS = _CONV_WIDTH_MINUS_1 + _NUM_SPEC
-_TREE_COLUMNS = _CONV_WIDTH_MINUS_1 + _BUDGET + 1  # tree conv width == (kernel - 1) + slots
+_TREE_COLUMNS = _CONV_WIDTH_MINUS_1 + _BUDGET + 1  # (kernel - 1) + slots
 _EXTRA_COLUMNS = _TREE_COLUMNS - _CHAIN_COLUMNS
 
 
@@ -40,8 +40,8 @@ def _chain_spec(page_size_padded=_POOL_PAGE_BYTES):
 
 
 def _tree_spec(page_size_padded=_POOL_PAGE_BYTES):
-    # ``_widen_mamba_spec_for_tree`` keeps num_speculative_blocks == slots - 1 and
-    # rewrites the conv shape to (kernel - 1) + slots columns.
+    # The tree widening keeps num_speculative_blocks == slots - 1 and rewrites
+    # the conv shape to (kernel - 1) + slots.
     return _spec(_TREE_COLUMNS, _BUDGET, page_size_padded)
 
 
@@ -78,7 +78,6 @@ def test_allocation_split_is_read_off_the_real_views():
     assert layer.buffer_bytes == _NUM_BLOCKS * spec.page_size_bytes
     assert layer.view_bytes_per_block_named("conv") == _CHAIN_COLUMNS * _CONV_COLUMN_BYTES
     assert layer.view_bytes_per_block_named("ssm") == _SSM_BYTES
-    # The rest of the page stride is padding no state view uses.
     assert layer.padding_bytes_per_block == _POOL_PAGE_BYTES - _CHAIN_COLUMNS * _CONV_COLUMN_BYTES - _SSM_BYTES
     assert [view.name for view in layer.views] == ["conv", "ssm"]
     assert layer.views[0].shape == (_CONV_DIM, _CHAIN_COLUMNS)
@@ -86,8 +85,7 @@ def test_allocation_split_is_read_off_the_real_views():
 
 
 def test_tree_columns_are_absorbed_by_the_page_padding():
-    # The pool already pads the mamba page up to the attention page, so a wider
-    # conv state eats padding instead of moving the block count.
+    # The pool already pads the page to the attention page, so wider conv eats padding.
     chain, tree = _chain_spec(), _tree_spec()
     raw, views = _allocate(chain)
     stats.record_mamba_allocation("chain", raw, views, chain, pool_blocks=_NUM_BLOCKS)
@@ -104,8 +102,7 @@ def test_tree_columns_are_absorbed_by_the_page_padding():
 
 
 def test_tree_columns_grow_the_page_when_nothing_pads_it():
-    # No attention page to hide behind: the extra conv columns widen the real
-    # stride, i.e. they cost device memory per block.
+    # No attention page to hide behind: the extra columns cost memory per block.
     chain, tree = _chain_spec(None), _tree_spec(None)
     raw, views = _allocate(chain)
     stats.record_mamba_allocation("chain", raw, views, chain, pool_blocks=_NUM_BLOCKS)
@@ -130,7 +127,6 @@ def test_step_counts_only_mamba_groups_and_nonzero_blocks():
             _group(SimpleNamespace(), ["attn0"]),  # not a Mamba group: skipped
         )
     )
-    # This is what the worker passes in: only the Mamba group is configured.
     stats.configure_mamba_mem_stats(
         enabled=True,
         sample_interval=1,
@@ -176,7 +172,6 @@ def test_report_carries_the_measured_numbers():
     assert f"spec_blocks={_NUM_SPEC}" in report
     assert "row_width_per_group=[4]" in report
     assert "x1 " in report  # one layer carries this layout
-    # Real block ids of the pool that the mamba state held at the sampled step.
     assert f"of pool_blocks={_NUM_BLOCKS}" in report
     assert "concurrent requests" in report
 

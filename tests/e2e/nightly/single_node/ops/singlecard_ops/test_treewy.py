@@ -64,8 +64,8 @@ def test_treewy_matches_native_recurrence_across_steps(slots, use_graph):
         if step % 2:
             parents_cpu //= 2
         inputs["tree_parents"].copy_(parents_cpu[None])
-        # The metadata builder prepares this stable buffer before graph replay.
-        # Reusing a stale topology changes the commit after a branch switch.
+        # The builder prepares this stable buffer before replay; a stale topology
+        # would change the commit after a branch switch.
         inputs["ancestors"].copy_(treewy_ancestor_mask(inputs["tree_parents"], inputs["tree_num_nodes"]))
         for name in ("query", "key"):
             inputs[name].copy_(torch.nn.functional.normalize(torch.randn(slots, 2, 128, device=device), dim=-1))

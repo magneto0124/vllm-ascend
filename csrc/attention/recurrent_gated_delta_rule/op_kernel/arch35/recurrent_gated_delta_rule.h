@@ -191,9 +191,8 @@ public:
                 copyFlag++;
                 if (copyFlag == 1) {
                     if (hasInitStateIndices_) {
-                        // Draft tree: the host hands over the page each token
-                        // starts from (see spec_decode/tree/state_rollback.py);
-                        // the root token continues the committed prefix.
+                        // Draft tree: host supplies the page each token starts from
+                        // (spec_decode/tree/state_rollback.py); the root continues the committed prefix.
                         int32_t initStateIdx = initStateIndicesGm_.GetValue(seq0);
                         if (initStateIdx < 0) {
                             return;
@@ -300,9 +299,8 @@ private:
         }
     }
 
-    // ``initStateGm_`` and ``finalStateGm_`` are the same pages, so a token that
-    // branches away from the previous token has to wait for that token's state
-    // write (MTE3) before reading the page back (MTE2).
+    // initStateGm_ and finalStateGm_ are the same pages, so a token branching away from the
+    // previous one must wait for that token's state write (MTE3) before reading the page (MTE2).
     __aicore__ inline void SyncStateWriteVisible()
     {
         int32_t eventIdMTE3ToMTE2 = static_cast<int32_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
@@ -552,8 +550,7 @@ private:
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
             LoadPrefetchedState(curSingleV);
             if (!hasInitStateIndices_) {
-                // Linear chain: overlap fetching the next state tile with the
-                // token loop below.
+                // Linear chain: prefetch the next state tile while the token loop runs.
                 PrefetchNextStateTile(stateOffset, head_i, v_i, nextVOffset, nextSingleV);
             }
             uint64_t pendingAttnOffset = 0;
@@ -568,10 +565,8 @@ private:
                 uint64_t curStateOutOffset =
                     ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
                 if (hasInitStateIndices_ && seq_i > seq0) {
-                    // stateInUb holds the state the previous token wrote, which is
-                    // exactly this node's initial state when it continues that
-                    // token (linear chunk rows and the accepted chain). Only a
-                    // different parent page has to be fetched again.
+                    // stateInUb holds what the previous token wrote, which is this node's initial
+                    // state when it continues that token; only a different parent page is re-fetched.
                     int32_t parentStateIdx = initStateIndicesGm_.GetValue(seq_i);
                     if (parentStateIdx < 0) {
                         return;
@@ -614,8 +609,7 @@ private:
                 CopyOutState(pendingStateOffset, curSingleV);
             }
             if (hasInitStateIndices_) {
-                // Draft tree: the per-token reload inside the loop reuses
-                // stateInQueue_, so the next tile is fetched after the loop.
+                // Draft tree: the per-token reload reuses stateInQueue_, so prefetch after the loop.
                 PrefetchNextStateTile(stateOffset, head_i, v_i, nextVOffset, nextSingleV);
             }
         }

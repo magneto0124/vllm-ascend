@@ -3,10 +3,8 @@
 
 """Benchmark one layer's TreeWY tensor math, excluding conv/sampling/scatter.
 
-Run with --device npu on Ascend; CPU timings are not NPU speedup estimates.
-Use --baseline /path/to/old_treewy.py to compare another source revision.
---count-ops counts ATen dispatches, not device kernel launches.
---accuracy-steps checks repeated commits against independent FP64 CPU recurrence.
+--device npu is required for real numbers; --baseline compares another source revision,
+--count-ops counts ATen dispatches, --accuracy-steps checks commits against FP64 CPU recurrence.
 """
 
 import argparse
@@ -105,8 +103,7 @@ def run(module, inputs, paths, sampled, args, device):
     prepare_topology = getattr(module, "treewy_ancestor_mask", None)
     topology_result = None
     if prepare_topology is not None:
-        # Production metadata refreshes this buffer once per batch and shares
-        # it across GDN layers. Report this cost separately from each layer.
+        # Refreshed once per batch and shared across GDN layers; timed separately from each layer.
         def build_topology():
             return prepare_topology(inputs["tree_parents"], inputs["tree_num_nodes"])
 

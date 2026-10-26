@@ -52,70 +52,26 @@ def tree_causal_conv1d(
     bias: torch.Tensor | None,
     activation: bool,
 ) -> torch.Tensor:
-    """Causal short conv of a draft-tree verify batch.
+    """Causal short conv over each tree node's own root-to-node ancestors.
 
-    ``npu_causal_conv1d_custom`` slides a single window along the batch order,
-    i.e. over the parent/child order of a linear chain. A draft tree verifies a
-    whole tree per request, so every node has to convolve over its *own*
-    root-to-node ancestors instead; ``window_rows`` (``[T, width]``) gathers
-    them from ``cat([committed history, this step's activations])``, see
-    ``spec_decode/tree/state_rollback.compute_tree_conv_rows``.
-
-    The committed history is the state page's first ``width - 1`` columns. It is
-    re-anchored here, before it is read: ``prefix_src`` (``[R, width - 1]``
-    conv-state columns, see ``compute_tree_prefix_source``) points at the
-    ``width - 1`` activations ending at the node the sampler accepted last step,
-    which live in the page's node columns (columns ``width - 1 + node id``, the
-    activations this op stored while verifying the accepted tree) or in the
-    prefix itself once the accepted path is shorter than the window. The page
-    therefore keeps this step's node activations for the next step to pick from,
-    and the prefix columns hold the linear-chain convention -- the last
-    ``width - 1`` activations of the committed path -- at all times.
-
-    Args:
-        x: ``[T, conv_dim]`` activations of the spec batch, request-major with
-            ``1 + budget`` tokens per request.
-        weight: ``[conv_dim, width]`` conv weights, oldest tap first (the layout
-            of ``self.conv1d.weight``, i.e. the transpose of the op's).
-        conv_state: the conv cache, ``[blocks, state_len, conv_dim]`` or
-            ``[blocks, conv_dim, state_len]`` on dim-first layouts; the last
-            ``slots`` columns (``[width - 1 + slots, ...)``) hold the node
-            activations of the previous step.
-        cache_indices: ``[R, slots]`` state pages packed token-major (see
-            ``gdn_attn_builder._pack_tree_rows_to_tokens``); a request's running
-            state block sits at its token start.
-        query_start_loc: ``[R + 1]`` spec batch token offsets; zero-length rows
-            (full-graph padding) are skipped.
-        window_rows: ``[T, width]`` rows of every node's conv taps.
-        prefix_src: ``[R, width - 1]`` columns of the new committed history.
-        bias: optional conv bias.
-        activation: whether to apply the SiLU activation.
-
-    Returns:
-        ``[T, conv_dim]`` conv activations.
+    ``window_rows``/``prefix_src`` come from ``state_rollback.compute_tree_conv_rows``;
+    zero-length rows (full-graph padding) are skipped. The committed history is
+    re-anchored on the accepted node before it is read. Returns ``[T, conv_dim]``.
     """
     width = weight.shape[1]
     conv_dim = weight.shape[0]
     starts = query_start_loc.to(torch.long)
     rows = starts.numel() - 1
-    # ``cache_indices`` is packed token-major, so a request's running state block
-    # is the entry at its token start. Full-graph padding replays with
-    # zero-length rows: they own no state page, so read a harmless one and skip
-    # their state update below. Only real rows contribute tokens, so they are
-    # exactly the rows of ``x``.
+    # cache_indices is packed token-major (a request's page sits at its token start);
+    # full-graph padding rows own no page and are skipped below.
     pages = cache_indices.reshape(-1)[starts[:rows]].to(torch.long).clamp(min=0)
     valid = torch.diff(starts) > 0
-    # Keep the row dimension fixed for torch.compile/ACL graph capture.  A
-    # boolean index such as ``pages[valid]`` produces a dynamically sized
-    # tensor when full-graph padding is present, which is not representable in
-    # the captured graph.  Inactive rows use their harmless page and are
-    # masked out below, so every intermediate keeps the fixed ``rows`` shape.
+    # Keep the row count fixed for graph capture: a boolean index would give a dynamic
+    # shape, so inactive rows keep a harmless page and are masked below.
     page_ids = pages
     dim_first = is_conv_state_dim_first()
 
-    # Re-anchor the committed history on the node the sampler accepted last
-    # step, before reading it: the page still holds that step's node
-    # activations in columns [width - 1, width - 1 + slots).
+    # Re-anchor the committed history on the node accepted last step before reading it.
     state = conv_state[page_ids]
     columns = prefix_src.to(torch.long)
     if dim_first:
@@ -135,9 +91,7 @@ def tree_causal_conv1d(
     history = state[:, :, : width - 1].transpose(1, 2) if dim_first else state[:, : width - 1, :]
     source = torch.cat((history.reshape(-1, conv_dim), x), dim=0)
     taps = source.index_select(0, window_rows.reshape(-1).to(torch.long)).view(-1, width, conv_dim)
-    # Match the native causal-conv kernel: it converts the inputs and weights
-    # to FP32 before multiplying and accumulates in FP32. BF16 products and a
-    # BF16 bias/activation at every GDN layer change the verified logits.
+    # Match the native kernel: FP32 products/accumulation (BF16 changes verified logits).
     out = (taps.float() * weight.transpose(0, 1).float()).sum(dim=1)
     if bias is not None:
         out = out + bias.float()
@@ -145,11 +99,8 @@ def tree_causal_conv1d(
         out = torch.nn.functional.silu(out)
     out = out.to(x.dtype)
 
-    # Keep this step's node activations for the next step's history: the token at
-    # packed position ``p`` is node ``p - start(row)`` of its request, i.e. column
-    # ``width - 1 + node`` of that request's state page. A row may verify fewer
-    # than ``slots`` tokens; the columns past its nodes keep the previous step's
-    # activations, and no window the next step builds reads them.
+    # Keep this step's activations at column width-1+node for the next step's history;
+    # columns past a row's nodes keep the previous step's values and are never read.
     positions = torch.arange(x.shape[0], device=starts.device)
     row_of_token = (positions.unsqueeze(1) >= starts[1:].unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
     token_columns = width - 1 + positions - starts[:rows][row_of_token]
@@ -174,30 +125,11 @@ def _chunked_tree_verify(
     plan,
     num_actual_tokens: int,
 ) -> torch.Tensor:
-    """Verify a draft tree wider than the recurrent kernel's per-call width.
+    """Verify a tree wider than the recurrent kernel's per-call width, chunk by chunk.
 
-    One ``npu_recurrent_gated_delta_rule`` call verifies at most
-    ``GDN_RECURRENT_MAX_VERIFY_TOKENS`` tokens per request: the kernel's per-token
-    row buffers are sized by that constant and it *returns without updating the
-    state* above it. ``plan`` (see
-    ``spec_decode/tree/state_rollback.compute_tree_verify_plan``) cuts the verify
-    into node-column chunks, chained through the state pages: node ``j`` loads its
-    parent's page through ``init_state_indices``, which the chunk that verified
-    the parent already wrote (every builder guarantees ``parent_id < node_id``).
-    Each chunk is a padded ``rows * width`` token grid whose padding cells are
-    skipped through ``cu_seqlens``, so every recorded call has the same shape.
-
-    Args:
-        query: ``[1, tokens, nk, dk]`` in the packed token order of the step (the
-            same for ``key``), ``value`` ``[1, tokens, nv, dv]``, ``g``/``beta``
-            ``[1, tokens, nv]``.
-        state_indices: ``[rows, slots]`` packed ssm state table of this step,
-            used to check that ``plan`` belongs to this step.
-        num_actual_tokens: rows of the output buffer reserved for chunk padding,
-            past the last verified token.
-
-    Returns:
-        ``[tokens, nv, dv]``, in the packed token order of ``query``.
+    One call verifies at most ``GDN_RECURRENT_MAX_VERIFY_TOKENS`` tokens per request;
+    above that it returns without updating state (``state_rollback.compute_tree_verify_plan``).
+    Chunks are chained through the state pages, so a parent is verified before its children.
     """
     if state_indices.shape[0] != plan.rows:
         raise RuntimeError(
@@ -226,8 +158,7 @@ def _chunked_tree_verify(
             num_accepted_tokens=num_accepted_tokens,
             init_state_indices=chunk.init_state_indices,
         )
-        # Padding cells are scattered past the layer's real tokens, so the
-        # undefined output of a skipped row can never reach a verified token.
+        # Padding cells land past the real tokens, so a skipped row can't reach a verified token.
         out.index_copy_(0, chunk.out_indices, chunk_out)
     return out[:tokens]
 
@@ -512,9 +443,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
             if attn_metadata.spec_decode_metadata.conv_window_rows is not None:
-                # Draft tree: every node convolves over its own ancestors.
-                # Linearly ordered rows (siblings, unrelated nodes) never enter a
-                # node's window, which is what the sliding-window op assumes.
+                # Tree: every node convolves over its own ancestors, so siblings never enter a window.
                 window_rows = attn_metadata.spec_decode_metadata.conv_window_rows
                 mixed_qkv_spec = tree_causal_conv1d(
                     mixed_qkv_spec,
@@ -692,8 +621,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     .index_select(0, row_starts)
                     .clamp_min(0)
                 )
-                # index_select already materializes an independent buffer; a
-                # second clone only adds a full recurrent-state copy per layer.
+                # index_select already copies; a second clone would copy the state per layer.
                 initial_state = ssm_state.index_select(0, root_state_indices.to(torch.long))
                 tree_result = treewy_verify_torch(
                     query_spec.squeeze(0),
@@ -725,8 +653,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             else:
                 verify_plan = spec_metadata.verify_plan
                 if verify_plan is not None:
-                    # Draft tree wider than one recurrent-op call: verify it in
-                    # chunks of node columns (see _chunked_tree_verify).
+                    # Tree wider than one op call: verify in node-column chunks (_chunked_tree_verify).
                     core_attn_out_spec = _chunked_tree_verify(
                         query_spec,
                         key_spec,
@@ -741,15 +668,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         num_actual_tokens=num_actual_tokens,
                     ).unsqueeze(0)
                 else:
-                    # Dispatches to the vllm-ascend AscendC custom operator
-                    # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
-                    # The custom op extends dtype support (e.g. float32 state) and is
-                    # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
+                    # AscendC custom op (csrc/recurrent_gated_delta_rule), not CANN; loaded via ASCEND_CUSTOM_OPP_PATH.
                     spec_recurrent_kwargs = {}
                     if init_state_indices is not None:
-                        # Draft tree: every node loads its state from its parent's slot
-                        # (see spec_decode/tree/state_rollback.py). The op must be built
-                        # with the ``init_state_indices`` input.
+                        # Tree: each node loads its parent's state slot through init_state_indices.
                         spec_recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
                     core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                         query=query_spec.squeeze(0),

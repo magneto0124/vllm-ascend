@@ -31,8 +31,7 @@ def _reference_inputs():
     g = -torch.rand(token_count, value_heads) * 0.2
     beta = torch.rand(token_count, value_heads)
     initial_state = torch.randn(rows, value_heads, value_dim, key_dim)
-    # Row 0 branches at nodes 1 and 2; row 1 is the linear-chain case used by
-    # mixed prompt/tree batches.
+    # Row 0 branches at nodes 1 and 2; row 1 is the linear-chain case.
     parents = torch.tensor([[0, 0, 1, 0], [0, 1, 2, 3]], dtype=torch.int32)
     row_widths = torch.tensor([slots, slots], dtype=torch.int32)
     tree_num_nodes = torch.tensor([slots - 1, 0], dtype=torch.int32)
@@ -126,8 +125,7 @@ def test_treewy_reference_matches_token_recurrence_on_tree_and_chain_rows():
     expected_decay = _expected_cumulative_decay(g, widths, parents, tree_num_nodes)
     torch.testing.assert_close(result.log_decay.exp(), expected_decay.exp())
 
-    # The accepted path is root -> node 1 -> node 3. The chain row commits its
-    # third accepted prefix node directly.
+    # Accepted path root -> node 1 -> node 3; the chain row commits its third node.
     path_node_ids = torch.tensor([[1, 3, -1, -1], [-1, -1, -1, -1]])
     num_sampled = torch.tensor([3, 4], dtype=torch.int32)
     committed = treewy_reference_commit(
@@ -312,7 +310,6 @@ def test_treewy_commit_rejected_descendants_do_not_poison_next_step(gates):
     widths = torch.tensor([slots], dtype=torch.int32)
     tree_num_nodes = torch.tensor([slots - 1], dtype=torch.int32)
     scale = 1.0
-    # Use finite oracle intermediates to test commit independently of verify.
     reference = treewy_reference_verify(
         query, key, value, g, beta, initial_state, parents, widths, scale, tree_num_nodes
     )
@@ -405,11 +402,8 @@ def test_treewy_batched_updates_match_recurrence_over_multiple_steps(dtype):
 
 @pytest.mark.parametrize("slots", [17, 33, 65])
 def test_treewy_solve_stays_stable_for_identical_keys(slots):
-    """A full delta update with identical unit keys must return each new value.
-
-    Powers of the lower-triangular dependency matrix can grow combinatorially
-    here, so a finite Neumann series is not a numerically safe WY solver.
-    """
+    """A full delta update with identical unit keys must return each new value."""
+    # A finite Neumann series would be numerically unsafe here.
     torch.manual_seed(41)
     query = torch.ones(slots, 1, 1)
     key = torch.ones_like(query)
@@ -462,8 +456,8 @@ def test_treewy_solve_stays_stable_for_nearly_collinear_keys(slots):
         tree_num_nodes,
         1.0,
     )
-    # A long chain sums many nearly cancelling terms. Allow FP32 reduction
-    # error against a double-precision oracle, not exponentially growing error.
+    # A long chain sums many nearly cancelling terms: allow FP32 reduction error
+    # against a double-precision oracle.
     torch.testing.assert_close(result.output.double(), expected_output, rtol=1e-5, atol=3e-5)
     torch.testing.assert_close(result.pseudo_values.double(), expected_pseudo, rtol=1e-5, atol=1e-5)
     committed = treewy_commit_torch(
@@ -649,9 +643,8 @@ def test_treewy_reference_commit_keeps_tree_root_and_commits_folded_prompt_chunk
     )
     del expected_output
     torch.testing.assert_close(committed[0], expected_states[0, 0], rtol=1e-5, atol=1e-5)
-    # The second row has no tree nodes: it is a linear prompt chunk folded
-    # into the verify batch. The sampler intentionally reports zero samples
-    # for that row, but its full recurrent state still has to be committed.
+    # Row 1 has no tree nodes: a linear prompt chunk folded into the verify
+    # batch, whose full recurrent state still has to be committed.
     torch.testing.assert_close(committed[1], expected_states[1, widths[1] - 1], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(tensor_result.output, result.output, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(tensor_committed, committed, rtol=1e-5, atol=1e-5)
@@ -767,9 +760,8 @@ def test_treewy_commit_contexts_handles_full_graph_padding():
     inputs = _reference_inputs()
     query, key, value, g, beta, initial_state, parents, widths, tree_num_nodes = inputs
     slots = parents.shape[1] + 1
-    # The padded row maps back to page 0, as graph padding may use a safe page
-    # that is also referenced by a real request. Its initial state must match
-    # the page it aliases.
+    # The padded row aliases page 0, a safe page a real request also uses, so its
+    # initial state must match the aliased page.
     padded_initial_state = torch.cat((initial_state, initial_state[:1]))
     padded_parents = torch.cat((parents, parents[:1]))
     padded_widths = torch.tensor([slots, slots, slots], dtype=torch.int32)
@@ -805,8 +797,7 @@ def test_treewy_commit_contexts_handles_full_graph_padding():
         state=state_pages,
         ancestors=result.ancestors,
     )
-    # Sampler outputs cover only the two real requests; the graph context has a
-    # third padded row with a full verify width.
+    # Sampler outputs cover the two real requests; the context has a padded third.
     path_node_ids = torch.tensor([[1, -1, -1, -1], [1, 2, -1, -1]])
     num_sampled = torch.tensor([2, 3], dtype=torch.int32)
 
@@ -901,8 +892,8 @@ def test_treewy_reference_supports_truncated_rows_and_per_value_beta():
     torch.testing.assert_close(tensor_result.output, result.output, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(tensor_result.pseudo_values, result.pseudo_values, rtol=1e-5, atol=1e-5)
 
-    # The tree row is truncated before node 4 and accepts root -> 1 -> 3.
-    # The second row is a two-token chain packed immediately after it.
+    # The tree row is truncated before node 4 and accepts root -> 1 -> 3; row 1 is
+    # a two-token chain packed right after it.
     path_node_ids = torch.tensor([[1, 3, -1, -1], [-1, -1, -1, -1]])
     num_sampled = torch.tensor([3, 2], dtype=torch.int32)
     committed = treewy_reference_commit(

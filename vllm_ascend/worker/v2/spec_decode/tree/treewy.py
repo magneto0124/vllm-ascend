@@ -3,19 +3,11 @@
 
 """TreeWY GDN verification and accepted-state reconstruction.
 
-The reference functions are deliberately slow and synchronizing, and serve as
-the numerical oracle for tests. The tensor-only functions provide a framework
-execution path while the fused Ascend operator is developed.
-
-For a node ``t`` with parent ``p(t)``, GDN updates
-
-    S_t = exp(g_t) S_{p(t)} + u_t k_t^T,
-    u_t = beta_t (v_t - exp(g_t) S_{p(t)} k_t).
-
-Let ``d_t`` be the product of ``exp(g)`` from the committed state through node
-``t``. Expanding the recurrence gives a strictly lower-triangular system over
-the tree's strict ancestors. The solution stores only ``u_t`` per node; the
-accepted state is reconstructed from the pseudo-values on the accepted path.
+Per node ``t`` with parent ``p(t)``: ``S_t = exp(g_t) S_{p(t)} + u_t k_t^T`` and
+``u_t = beta_t (v_t - exp(g_t) S_{p(t)} k_t)``. Only ``u_t`` is stored per node; the
+accepted state is rebuilt from those pseudo-values along the accepted path. The reference
+functions are slow, synchronizing test oracles; the tensor-only ones are the current
+Ascend execution path until a fused operator lands.
 """
 
 from dataclasses import dataclass
@@ -92,17 +84,8 @@ def treewy_reference_verify(
 ) -> TreeWYReferenceResult:
     """Run the GDN recurrence in TreeWY form as a test-only oracle.
 
-    ``query`` and ``key`` use ``[tokens, key_heads, key_dim]`` layout;
-    ``value`` uses ``[tokens, value_heads, value_dim]``; ``g`` and scalar
-    ``beta`` use ``[tokens, value_heads]`` (or per-value ``beta`` uses
-    ``[tokens, value_heads, value_dim]``). ``initial_state`` is
-    ``[rows, value_heads, value_dim, key_dim]`` and ``tree_parents`` is
-    ``[rows, slots - 1]``. A row with ``tree_num_nodes == 0`` is interpreted as
-    a linear chain, which matches the existing mixed tree/prompt batching.
-
-    Inputs are expected to be CPU tensors in unit tests. This implementation is
-    intentionally simple and synchronizing; production code must use a native
-    device kernel.
+    Same input layouts as :func:`treewy_verify_torch`; CPU tensors, synchronizing by
+    design. A row with ``tree_num_nodes == 0`` is a linear chain.
     """
     if query.ndim != 3 or key.shape != query.shape:
         raise ValueError("query and key must have matching [tokens, heads, dim] shapes")
@@ -237,11 +220,8 @@ def treewy_reference_commit(
 ) -> torch.Tensor:
     """Reconstruct each accepted state from only its pseudo-values and keys.
 
-    ``num_sampled`` includes the trailing resample. For tree rows, the accepted
-    draft node is therefore ``path_node_ids[num_sampled - 2]``; when no draft
-    was accepted, the root node is committed. Chain rows commit the final
-    accepted prefix node. Rows with ``num_sampled == 0`` retain their initial
-    state (for example, a chunked prefill).
+    ``num_sampled`` includes the resample, so the accepted draft node is
+    ``path_node_ids[num_sampled - 2]`` (the root if none); chain rows commit their last node.
     """
     if tree_parents.ndim != 2:
         raise ValueError("tree_parents must have [rows, slots - 1] shape")
@@ -354,9 +334,8 @@ def _tree_token_indices(
     widths = row_widths.to(dtype=torch.long)
     node_ids = torch.arange(slots, device=widths.device)
     valid_nodes = node_ids[None, :] < widths[:, None]
-    # Keep the device-side validity mask: ACL graph replay can shorten a row
-    # without changing the captured input shape. Multiple rows still require
-    # packing because changing one width shifts all subsequent token offsets.
+    # Device-side mask: ACL graph replay can shorten a row without changing the captured
+    # shape; multiple rows still need packing (one width shifts all later token offsets).
     if rows == 1 and token_count == slots:
         return None, valid_nodes
     starts = torch.cumsum(widths, dim=0) - widths
@@ -457,12 +436,8 @@ def treewy_verify_torch(
 ) -> TreeWYVerificationResult:
     """Tensor-only TreeWY verify path suitable for device execution.
 
-    Batch projections and the scalar-beta WY solve across nodes. The latter
-    uses a direct unit-lower-triangular solve. All loop
-    bounds depend only on tensor shapes, with no host reads or per-node state
-    snapshots. ``ancestors`` may be prepared once by the metadata builder and
-    shared across layers, with its stable buffer refreshed before graph replay.
-    Inputs use the same layouts as :func:`treewy_reference_verify`.
+    Loop bounds depend only on tensor shapes: no host reads, no per-node state snapshots.
+    ``ancestors`` may be prepared once by the metadata builder (refresh before graph replay).
     """
     rows, parent_columns = tree_parents.shape
     slots = parent_columns + 1
@@ -485,8 +460,7 @@ def treewy_verify_torch(
     log_decay = torch.bmm(ancestors.float(), g_grid.float())
     log_decay_heads = log_decay.permute(0, 2, 1)
     decay = log_decay_heads.exp().unsqueeze(-1)
-    # Non-ancestor differences may be positive: clamp BEFORE exp, even though
-    # the corresponding coefficients will subsequently be masked to zero.
+    # Non-ancestor differences may be positive: clamp BEFORE exp (masked to zero later).
     decay_ratio = (log_decay_heads.unsqueeze(-1) - log_decay_heads.unsqueeze(-2)).clamp(max=0.0).exp()
     inclusive_weights = decay_ratio * ancestors[:, None]
     strict_weights = inclusive_weights * ~torch.eye(slots, dtype=torch.bool, device=key.device)
@@ -498,13 +472,11 @@ def treewy_verify_torch(
     if beta.ndim == 2:
         beta_heads = beta_grid.permute(0, 2, 1).float().unsqueeze(-1)
         lower = beta_heads * dependencies
-        # Solve directly as in the author's reference; forming the inverse
-        # adds rounding and many small matmuls. The stored diagonal is zero
-        # and is ignored by unitriangular=True.
+        # Direct solve as in the reference; forming the inverse adds rounding and many
+        # small matmuls. unitriangular=True ignores the stored zero diagonal.
         pseudo_heads = torch.linalg.solve_triangular(lower, beta_heads * residual, upper=False, unitriangular=True)
     else:
-        # Per-value beta has a different triangular system for every value
-        # channel. Keep substitution here rather than allocate [R,H,V,N,N].
+        # Per-value beta gives a system per channel: substitute rather than allocate [R,H,V,N,N].
         beta_heads = beta_grid.permute(0, 2, 1, 3).float()
         pseudo_rows = []
         for node in range(slots):
@@ -547,8 +519,8 @@ def treewy_commit_torch(
 ) -> torch.Tensor:
     """Reconstruct the sampled state using device tensors only.
 
-    ``initial_state`` is the committed state at the start of verification. Rows
-    with no sampled token or no verified node retain that state unchanged.
+    ``initial_state`` is the committed state at the start of verification; rows with no
+    sampled token or no verified node keep it unchanged.
     """
     rows, parent_columns = tree_parents.shape
     slots = parent_columns + 1
@@ -584,8 +556,7 @@ def treewy_commit_torch(
         1, accepted_nodes[:, None, None].expand(rows, 1, value_heads)
     ).squeeze(1)
     state = accepted_log_decay.exp()[:, :, None, None] * initial_state.float()
-    # Reduce all accepted rank-one updates in one batched matmul, rather than
-    # read and write the full [R,H,V,K] state once per verified node.
+    # Apply all accepted rank-one updates in one batched matmul, not one [R,H,V,K] rewrite per node.
     ratio = (accepted_log_decay[:, None] - log_decay.float()).clamp(max=0.0).exp()
     coefficient = ratio * (accepted_ancestors & valid_nodes)[:, :, None]
     weighted_pseudo = (coefficient[:, :, :, None] * pseudo_grid.float()).permute(0, 2, 3, 1)
@@ -626,11 +597,9 @@ def treewy_commit_contexts_torch(
             ancestors=context.ancestors,
         )
         chain_rows = context.tree_num_nodes == 0
-        # FULL graphs may carry padded request rows with a full verify width,
-        # even though the sampler only returns rows for real requests. A padded
-        # row can map to a harmless or reused state page, so never let its
-        # synthetic linear-chain result overwrite a real request's committed
-        # state.
+        # FULL graphs may carry padded rows with a full verify width, though the sampler
+        # only returns real requests; a padded row can map to a reused state page, so its
+        # synthetic chain result must never overwrite a real request's committed state.
         active = valid_rows & ((sampled > 0) | chain_rows) & (context.row_widths > 0)
         pages = context.root_state_indices.to(torch.long)[active]
         context.state.index_copy_(0, pages, accepted_state[active])

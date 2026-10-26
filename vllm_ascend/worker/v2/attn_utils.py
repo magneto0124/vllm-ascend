@@ -72,6 +72,7 @@ from vllm_ascend.worker.v2.mamba_mem_stats import (
     kv_allocation_region,
     record_mamba_allocation,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time, tree_timer_enabled
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
@@ -80,16 +81,10 @@ if TYPE_CHECKING:
 def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
     """Size a Mamba state spec for the ``tree_spec_config`` draft tree.
 
-    ``MambaBase.get_kv_cache_spec`` derives ``num_speculative_blocks`` from
-    ``num_speculative_tokens``, which describes a linear draft chain. A draft
-    tree's recurrent page count depends on the selected update method: snapshot
-    keeps one page per node, while TreeWY needs one committed page.
-
-    The short-conv state is sized independently. It keeps all ``1 + budget``
-    node activations in the page (columns ``width - 1 .. width - 1 + slots``)
-    so the next step can rebuild committed history from whichever node the
-    sampler accepted (see ``ops/gdn.tree_causal_conv1d``). Every GDN layer gets
-    the same width, which keeps the mamba layers inside one uniform KV cache group.
+    Recurrent page count follows the update method (snapshot: one page per node,
+    TreeWY: one committed page). Short-conv keeps all ``1 + budget`` node
+    activations in the page (see ``ops/gdn.tree_causal_conv1d``), and every GDN
+    layer shares one width so the mamba layers stay in a uniform KV cache group.
     """
     from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
         tree_conv_slot_count,
@@ -109,20 +104,17 @@ def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> Mamb
 
     num_spec = vllm_config.speculative_config.num_speculative_tokens
     if recurrent_slots != spec.num_speculative_blocks + 1:
-        # Snapshot keeps one recurrent state page per tree node. TreeWY only
-        # needs the committed page; its accepted state is rebuilt after sample.
+        # Snapshot stores one recurrent page per tree node; TreeWY only needs the
+        # committed page (accepted state is rebuilt after sample).
         spec = replace(spec, num_speculative_blocks=recurrent_slots - 1)
 
     conv_state_shape = spec.shapes[0]
     width = tree_conv_width(spec.mamba_type, tuple(conv_state_shape), num_spec)
-    # The conv cache keeps one activation per verified node, independently of
-    # how many recurrent snapshots the selected state update method stores.
+    # The conv cache keeps one activation per verified node, whatever the state method.
     extra_columns = conv_slots - num_spec
     if width is None or extra_columns <= 0:
         return spec
-    # The conv dimension is the larger side; the extra node columns widen the
-    # page by exactly their bytes. ``shapes`` and ``dtypes`` are positional, so
-    # entry 0 is the conv state this branch widens.
+    # Conv dim is the larger side; the node columns widen shapes[0] (positional) by their bytes.
     conv_dim = max(conv_state_shape)
     expected_columns = width - 1 + conv_slots
     conv_state_shape = (
@@ -349,7 +341,7 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
+        for attn_group_idx, attn_group in enumerate(attn_groups[i]):
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
@@ -375,16 +367,29 @@ def build_attn_metadata(
                 )
 
             if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
+                build_metadata = attn_metadata_builder.build_for_cudagraph_capture
+                build_args = (common_attn_metadata,)
+                build_kwargs = attn_metadata_extra_kwargs
             else:
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
+                build_metadata = attn_metadata_builder.build
+                build_args = ()
+                build_kwargs = {
+                    "common_prefix_len": 0,
+                    "common_attn_metadata": common_attn_metadata,
                     **attn_metadata_extra_kwargs,
+                }
+
+            # Per-group segment tells mixed-attention builders apart; the timer syncs.
+            if tree_timer_enabled() and not for_cudagraph_capture:
+                builder_name = type(attn_metadata_builder).__name__
+                num_layers = len(getattr(attn_group, "layer_names", ()))
+                timer_name = (
+                    f"attn_metadata_build_kv{i}_group{attn_group_idx}_{builder_name}_layers{num_layers}"
                 )
+                with tree_time(timer_name):
+                    metadata = build_metadata(*build_args, **build_kwargs)
+            else:
+                metadata = build_metadata(*build_args, **build_kwargs)
             if is_dsa_builder:
                 # Preserve sharing even if a builder replaces one of the
                 # dictionaries while constructing its metadata.
@@ -1164,8 +1169,7 @@ def _reshape_kv_cache_v2(
                 mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
                 if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
                     raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
-                # Account the real buffer and the views just carved out of it;
-                # a no-op unless additional_config.mamba_mem_stats_config is on.
+                # Account the real buffer and its views; no-op unless mamba_mem_stats is on.
                 record_mamba_allocation(
                     layer_name,
                     raw_cache,

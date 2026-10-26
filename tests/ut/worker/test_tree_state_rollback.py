@@ -25,8 +25,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
 )
 
 _NUM_SPEC = 3
-# Largest tree width the single-call verify path serves: 1 + budget == MAX_MTP
-# (16). A wider tree is verified in chunks, see the verify-plan tests below.
+# Widest tree the single-call verify path serves (1 + budget == MAX_MTP).
 _BUDGET = 15
 _CONV_DIM = 8192
 _CONV_WIDTH_MINUS_1 = 3  # width == 4
@@ -35,8 +34,6 @@ _METHOD = "snapshot"
 
 @pytest.fixture
 def tree_enabled(monkeypatch):
-    """Force ``tree_spec_config`` on with a fixed budget."""
-
     def _enable(budget=_BUDGET, gdn_state_update=_METHOD):
         monkeypatch.setattr(
             "vllm_ascend.worker.v2.spec_decode.dflash_tree_spec_enabled",
@@ -56,8 +53,7 @@ def tree_enabled(monkeypatch):
 
 
 def _config(**kwargs):
-    # ``_widen_mamba_spec_for_tree`` reads the speculation width off the real
-    # VllmConfig, so the stub has to carry a speculative config as well.
+    # The real VllmConfig is read for width, so the stub carries a spec config.
     return SimpleNamespace(
         **{
             "use_v2_model_runner": True,
@@ -80,9 +76,7 @@ def _spec(num_spec=_NUM_SPEC, mamba_type=MambaAttentionBackendEnum.GDN_ATTN):
 
 
 def test_resume_column_uses_last_accepted_node():
-    # num_sampled counts the accepted drafts plus the trailing resample, so the
-    # last accepted node sits at index num_sampled - 2. path index num_sampled - 1
-    # is already the -1 padding of the tree walk.
+    # num_sampled = accepted drafts + trailing resample: last accepted node is -2.
     path = torch.tensor([[7, 11, -1, -1], [4, -1, -1, -1], [-1, -1, -1, -1]])
     num_sampled = torch.tensor([3, 2, 1], dtype=torch.int32)
 
@@ -90,7 +84,7 @@ def test_resume_column_uses_last_accepted_node():
 
 
 def test_resume_column_falls_back_to_root_slot():
-    # Chunked prefill samples nothing and the tree walk only pads the paths.
+    # Chunked prefill samples nothing; the tree walk only pads the paths.
     path = torch.full((2, 4), -1, dtype=torch.long)
     num_sampled = torch.zeros((2,), dtype=torch.int32)
 
@@ -149,8 +143,7 @@ def test_validate_rejects_other_state_backends():
 
 
 def test_validate_accepts_a_tree_wider_than_one_kernel_call():
-    # A tree wider than the recurrent kernel's per-call width is verified in
-    # chunks (compute_tree_verify_plan), so it is not rejected at startup.
+    # Over-wide trees are verified in chunks, so startup must not reject them.
     validate_tree_state_slots(GDN_RECURRENT_MAX_VERIFY_TOKENS * 4, MambaAttentionBackendEnum.GDN_ATTN)
 
 
@@ -160,7 +153,6 @@ def test_validate_rejects_an_empty_verify():
 
 
 def test_validate_accepts_the_registered_snapshot_method(tree_enabled):
-    """``snapshot`` is the method the GDN state path implements end to end."""
     tree_enabled()
     method = GDN_STATE_UPDATE_METHODS[_METHOD]
     assert method.state_init and method.conv
@@ -176,10 +168,7 @@ def test_validate_rejects_an_unknown_state_update(tree_enabled):
 
 
 def test_validate_ignores_the_state_update_for_other_backends(tree_enabled):
-    # The key is GDN-only: another state backend fails on the backend and never
-    # on the value -- even a nonsense one.
     tree_enabled(gdn_state_update="magic-snapshot")
-
     with pytest.raises(NotImplementedError, match="only GDN_ATTN"):
         validate_tree_state_slots(4, MambaAttentionBackendEnum.MAMBA2)
 
@@ -209,12 +198,10 @@ def test_validate_reports_a_method_without_conv_history(monkeypatch, tree_enable
 
 
 def test_config_defers_the_state_update_to_the_gdn_path():
-    """The key configures nothing by itself: a GDN model resolves it."""
     assert TreeSpecConfig().gdn_state_update == DEFAULT_GDN_STATE_UPDATE
     assert DEFAULT_GDN_STATE_UPDATE in GDN_STATE_UPDATE_METHODS
 
-    # No membership check at parse time, so a model that does not use GDN never
-    # trips over the value.
+    # No membership check at parse time, so non-GDN models never trip on it.
     config = TreeSpecConfig(
         enabled=True,
         method="prefix",
@@ -227,8 +214,8 @@ def test_config_defers_the_state_update_to_the_gdn_path():
 
 
 def test_slot_count_rejects_align_cache_mode(tree_enabled):
-    # The align pre-copy shifts the conv window by the accepted cursor, which a
-    # draft tree cannot express (see tree_state_slot_count).
+    # The align pre-copy shifts the conv window by the accepted cursor: a tree
+    # cannot express that.
     tree_enabled()
     config = _config(cache_config=SimpleNamespace(mamba_cache_mode="align"))
 
@@ -298,10 +285,7 @@ def test_widen_mamba_spec_adds_state_slots_and_conv_columns(tree_enabled, monkey
 
     widened = _widen_mamba_spec_for_tree(spec, _config())
 
-    # One recurrent state page per tree node ...
     assert widened.num_speculative_blocks == _BUDGET
-    # ... and the short-conv page keeps every node's activation, so it grows by
-    # the columns the tree has beyond the linear chain.
     extra_columns = (_BUDGET + 1) - _NUM_SPEC
     assert widened.shapes[0] == (_CONV_DIM, spec.shapes[0][1] + extra_columns)
     assert widened.shapes[1] == spec.shapes[1]
@@ -320,9 +304,7 @@ def test_widen_mamba_spec_keeps_chain_layout_without_tree(monkeypatch):
 
 
 def test_widen_mamba_spec_widens_the_conv_page_at_chain_width(tree_enabled, monkeypatch):
-    # ``budget == num_speculative_tokens``: the recurrent state needs no extra
-    # page, but the conv page still serves one node per verified token, i.e. one
-    # column more than the linear draft chain.
+    # budget == num_speculative_tokens: the conv page still needs one extra column.
     monkeypatch.setattr(
         "vllm_ascend.worker.v2.attn_utils.is_conv_state_dim_first",
         lambda: True,
@@ -355,10 +337,8 @@ def test_widen_mamba_spec_keeps_one_recurrent_page_for_treewy(tree_enabled, monk
 
 
 def test_tree_path_buffers_keep_the_tree_width(tree_enabled):
-    # The sampler hands over a path as wide as the draft chain while the tree
-    # budget is wider. The buffers must keep the tree width, or the width check
-    # in ``_tree_buffers`` re-creates (and zeroes) them on every step and the
-    # short-conv re-anchor silently never happens.
+    # Sampler paths are chain-wide; buffers must keep the tree width or they are
+    # re-created (and zeroed) every step.
     from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
         AscendMambaHybridModelState,
     )
@@ -376,8 +356,7 @@ def test_tree_path_buffers_keep_the_tree_width(tree_enabled):
 
     assert path.shape == (2, _BUDGET)
     assert num_sampled.shape == (2,)
-    # Same buffers on the next step, so what postprocess_state stored is still
-    # there when prepare_attn reads it.
+    # Same buffers next step, so postprocess_state's data survives to prepare_attn.
     assert stored_path is path
     assert stored_num_sampled is num_sampled
 
@@ -407,7 +386,7 @@ def _paths(parents_row, slots):
 def test_conv_window_rows_follow_node_ancestors():
     slots = 4
     width = 4
-    # Node 2 of row 0 branches off the root instead of node 1; row 1 is a chain.
+    # Row 1 is a chain.
     tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.long)
     tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
     rows = tree_parents.shape[0]
@@ -434,15 +413,13 @@ def test_conv_window_rows_follow_node_ancestors():
 
     assert window_rows.tolist() == expected_window
     assert window_rows.dtype == torch.int32
-    # A node never sees its siblings: node 2 of row 0 branches off the root, so
-    # its parent tap is the root and not node 1.
+    # Node 2 of row 0 branches off the root, so its parent tap is not node 1.
     assert window_rows[2].tolist() == expected_window[2]
     assert window_rows[2].tolist()[-2] == node_offset
 
 
 def test_conv_window_rows_keep_batch_order_for_folded_rows():
-    # A row folded in from a prompt chunk (tree_num_nodes == 0) is a linear
-    # sequence, so its window must be the batch-order one.
+    # A folded prompt-chunk row (tree_num_nodes == 0) stays linear batch order.
     slots = 3
     width = 4
     tree_parents = torch.zeros((1, slots - 1), dtype=torch.long)
@@ -459,20 +436,8 @@ def test_conv_window_rows_keep_batch_order_for_folded_rows():
     assert window_rows.tolist() == expected_window
 
 
-# ---------------------------------------------------------------------------
-# Chunked verify of a tree wider than one recurrent-op call
-# ---------------------------------------------------------------------------
-
-
 def _tree_tables(widths, slots):
-    """Packed state/parent tables of a chained tree, one request per row.
-
-    Row ``r`` keeps node ``j``'s state in page ``r * slots + j`` and starts from
-    the committed page ``rows * slots + r``; node ``j > 0`` continues node
-    ``j - 1``, so every parent has a smaller node id, which is what the chunk
-    chain relies on. Only the first ``sum(widths)`` entries carry a state: the
-    tables are packed token-major, like the builder packs them.
-    """
+    """Packed chained-tree tables: node ``j`` continues ``j - 1``, token-major."""
     rows = widths.numel()
     state = torch.zeros((rows, slots), dtype=torch.int32)
     parents = torch.zeros((rows, slots), dtype=torch.int32)
@@ -488,15 +453,7 @@ def _tree_tables(widths, slots):
 
 
 class _FakeRecurrentKernel:
-    """State bookkeeping of the AscendC ``Process`` loop.
-
-    Mirrors ``csrc/attention/recurrent_gated_delta_rule/op_kernel``: rows are
-    walked in order over their ``cu_seqlens`` range, a row of length 0 is skipped,
-    a row longer than ``MAX_MTP`` and a negative initial page abort the whole
-    call, the first token of a row loads ``init_state_indices`` unconditionally
-    and a later token only reloads when its parent page differs from the page the
-    previous token of the same row wrote.
-    """
+    """State bookkeeping of the AscendC ``Process`` loop."""
 
     def __init__(self, num_pages, max_mtp=GDN_RECURRENT_MAX_VERIFY_TOKENS):
         self.pages = [0.0] * num_pages
@@ -568,7 +525,6 @@ def test_verify_plan_covers_every_token_exactly_once():
     assert plan.num_chunks == 2
     assert plan.chunk_tokens == plan.rows * width
     starts = torch.cumsum(widths, dim=0) - widths
-    # The packed tables are their own token -> page map (see _tree_tables).
     flat_state = state.reshape(-1)
     flat_parents = parents.reshape(-1)
     seen = []
@@ -578,27 +534,23 @@ def test_verify_plan_covers_every_token_exactly_once():
         assert chunk.out_indices.dtype == torch.long
         assert chunk.state_indices.dtype == torch.int32
         assert chunk.init_state_indices.dtype == torch.int32
-        # The kernel's ``actual_seq_lengths`` convention: an unused base entry
-        # followed by the per-row token count. A row of length 0 is skipped.
+        # cu_seqlens: an unused base entry followed by the per-row token count.
         row_lengths = chunk.cu_seqlens[1:]
         assert chunk.cu_seqlens.dtype == torch.int32
         assert bool((row_lengths <= width).all())
         valid = (torch.arange(width).unsqueeze(0) < row_lengths.unsqueeze(1)).reshape(-1)
         padding = ~valid
-        # Padding cells are never processed: they carry no page in either table
-        # and their (undefined) op output goes past every verified token.
+        # Padding cells are never processed: no page, and their op output is parked
+        # past every verified token.
         assert bool((chunk.state_indices[padding] == -1).all())
         assert bool((chunk.init_state_indices[padding] == -1).all())
         assert bool((chunk.out_indices[padding] >= scratch_base).all())
-        # A verified cell reads its own parent page and writes its own page, both
-        # taken from the packed table of the step, and its op output lands on the
-        # token's own row of the output buffer.
+        # A verified cell reads its parent page, writes its own page, outputs its row.
         tokens = chunk.token_indices[valid]
         assert bool((chunk.state_indices[valid] == flat_state[tokens]).all())
         assert bool((chunk.init_state_indices[valid] == flat_parents[tokens]).all())
         assert bool((chunk.out_indices[valid] == tokens).all())
-        # Chunk ``index`` owns the node columns [index * width, (index + 1) * width)
-        # of every row, in order.
+        # Chunk ``index`` owns node columns [index * width, (index + 1) * width).
         token_grid = chunk.token_indices.reshape(plan.rows, width)
         mask_grid = valid.reshape(plan.rows, width)
         for row in range(plan.rows):
@@ -614,16 +566,14 @@ def test_verify_plan_covers_every_token_exactly_once():
 def test_chunked_verify_matches_one_wide_call():
     width = GDN_RECURRENT_MAX_VERIFY_TOKENS
     slots = 2 * width
-    # A row exactly one chunk wide, a full row, a short row, an empty (padded)
-    # row and a row that spans both chunks.
+    # Chunk-wide, full, short, empty (padded) and two-chunk rows.
     widths = torch.tensor([width, slots, 7, 0, slots - 3], dtype=torch.int32)
     state, parents = _tree_tables(widths, slots)
     tokens = int(widths.sum())
     values = torch.arange(1, tokens + 1, dtype=torch.float32)
     num_pages = int(widths.numel()) * slots + int(widths.numel()) + 8
 
-    # Reference: the step the kernel would run on its own if it could hold every
-    # node in one call (which is exactly what it must not be asked to do).
+    # Reference: the uncapped call the kernel must not be asked to run.
     reference = _FakeRecurrentKernel(num_pages, max_mtp=tokens)
     reference.run(
         torch.cat((torch.zeros(1, dtype=torch.int32), widths)),
@@ -640,8 +590,7 @@ def test_chunked_verify_matches_one_wide_call():
 
 
 def test_chunked_verify_chains_rows_through_their_parent_pages():
-    # Every row spans two chunks, so the first node of a row in the second chunk
-    # has to reload the state its parent page got in the first chunk.
+    # Rows span both chunks, so a second-chunk first node reloads its parent's state.
     width = GDN_RECURRENT_MAX_VERIFY_TOKENS
     slots = 2 * width
     widths = torch.tensor([slots, slots], dtype=torch.int32)
@@ -650,16 +599,13 @@ def test_chunked_verify_chains_rows_through_their_parent_pages():
 
     assert plan is not None
     for chunk in plan.chunks:
-        # The kernel accumulates the per-row lengths into token offsets itself.
         row_starts = chunk.cu_seqlens.cumsum(0)[:-1]
         for row in range(plan.rows):
             start = int(row_starts[row])
             end = start + int(chunk.cu_seqlens[row + 1])
             assert end > start
-            # The row's first cell always carries a real parent page: the kernel
-            # returns on a negative one.
+            # The row's first cell always carries a real parent page.
             assert int(chunk.init_state_indices[start]) >= 0
-            # A node that continues the previous token of the same row must not
-            # reload -- the state the previous token wrote is the one it needs.
+            # A continuing node must not reload: the previous token wrote its state.
             for token in range(start + 1, end):
                 assert int(chunk.init_state_indices[token]) == int(chunk.state_indices[token - 1])

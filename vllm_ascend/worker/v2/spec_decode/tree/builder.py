@@ -100,8 +100,14 @@ class TreeBuilder(ABC):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        graph_safe: bool = False,
     ) -> TreeLayout:
-        """Expand ``draft_logits`` [R, spec_num, vocab] into ``out``."""
+        """Expand ``draft_logits`` [R, spec_num, vocab] into ``out``.
+
+        ``graph_safe`` selects graph-compatible implementations for operations
+        that have an eager-only backend. Builders that cannot support captured
+        execution should reject this flag.
+        """
 
 
 def validate_tree_method_backend(method: str, draft_backend: str) -> None:

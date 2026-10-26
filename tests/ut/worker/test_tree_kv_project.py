@@ -95,7 +95,7 @@ def test_bind_groups_skips_mamba_state_groups():
 
     compact._bind_groups()
 
-    # Only the token-major attention group is compacted; mamba state pages are
+    # Only the token-major attention group is compacted; mamba pages are
     # addressed by request state slot and must be left alone.
     assert len(compact._groups) == 1
 
@@ -125,8 +125,7 @@ def test_compact_moves_accepted_path_and_keeps_mamba_state():
 
     assert torch.equal(conv_state, conv_before)
     assert torch.equal(ssm_state, ssm_before)
-    # Request 0 has num_computed = 16, so accepted nodes 2/5/6 sit at token
-    # positions 18/21/22 and land on the linear slots 17/18/19.
+    # Request 0 has num_computed = 16, so accepted nodes 2/5/6 land on slots 17/18/19.
     assert torch.equal(attn_cache[1, 1], attn_before[1, 2])
     assert torch.equal(attn_cache[1, 2], attn_before[1, 5])
     assert torch.equal(attn_cache[1, 3], attn_before[1, 6])
@@ -134,8 +133,8 @@ def test_compact_moves_accepted_path_and_keeps_mamba_state():
 
 def test_compact_moves_both_k_and_v_views_of_shared_allocation():
     attn_cache, conv_state, ssm_state = _fixture()
-    # This is the hybrid allocation layout: K and V share a storage pointer,
-    # but their views start at different offsets and must both be compacted.
+    # K and V share a storage pointer but start at different offsets; both views
+    # must be compacted.
     kv_backing = torch.stack((attn_cache, attn_cache + 1_000_000))
     k_cache, v_cache = kv_backing[0], kv_backing[1]
     assert k_cache.untyped_storage().data_ptr() == v_cache.untyped_storage().data_ptr()
@@ -156,9 +155,8 @@ def test_compact_moves_both_k_and_v_views_of_shared_allocation():
 
 def test_compact_skips_unallocated_tail_and_masked_request():
     attn_cache, conv_state, ssm_state = _fixture()
-    # Only two logical blocks are available per request. The accepted node
-    # at position 31 must move to position 30, but the unused path columns
-    # would otherwise look up logical block 2 (past the table's end).
+    # Only two logical blocks exist per request, but unused path columns would
+    # look up logical block 2, past the table's end.
     runner = _runner(_Layer(attn_cache), _Layer((conv_state, ssm_state)))
     runner.req_states.num_computed_tokens.gpu = torch.tensor([29, 29], dtype=torch.int32)
     runner.block_tables.block_tables = (

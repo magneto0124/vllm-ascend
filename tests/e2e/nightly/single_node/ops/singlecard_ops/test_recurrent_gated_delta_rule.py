@@ -73,9 +73,8 @@ def golden_recurrent_gated_delta_rule(
                 S = init_state[head_id]
             for slot_id in range(seq_start, seq_start + actual_seq_lengths[i]):
                 if init_state_indices is not None:
-                    # A tree node starts from its parent's completed state. If
-                    # it branches away from the previous token, the kernel must
-                    # reload the state page from its storage dtype.
+                    # A node starting from its parent's page must reload the state
+                    # from storage dtype when it branches off the previous token.
                     parent_state_idx = init_state_indices[slot_id]
                     S = initial_state[parent_state_idx][head_id]
                     if (
@@ -106,20 +105,14 @@ def test_recurrent_gated_delta_rule_tree_sibling_state_isolation(
     headnum,
     state_dtype,
 ):
-    """A sibling must reload its parent state, not inherit its prior sibling.
-
-    The flattened tree is [root, child_a, child_b]. Both children have the root
-    as parent, so child_b must start from the root page even though child_a is
-    the preceding token in the kernel's batch order.
-    """
+    """A sibling must reload its parent state, not inherit its prior sibling."""
     torch.manual_seed(seed)
     dtype = torch.bfloat16
     headnum_k, headnum_v = headnum
     seq_len = 3
     headdim_k = headdim_v = 128
 
-    # Pages 0..2 receive this step's [root, child_a, child_b] outputs; page 3
-    # holds the accepted-prefix state from which the root starts.
+    # Pages 0..2 take this step's outputs; page 3 holds the root's start state.
     state = torch.rand((4, headnum_v, headdim_v, headdim_k)).to(state_dtype)
     query = torch.nn.functional.normalize(
         torch.rand((seq_len, headnum_k, headdim_k)), p=2, dim=-1

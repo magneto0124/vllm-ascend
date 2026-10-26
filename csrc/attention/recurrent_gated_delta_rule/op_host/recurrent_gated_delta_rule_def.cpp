@@ -68,9 +68,7 @@ public:
             .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        // Draft-tree state rollback: page each token loads its initial recurrent
-        // state from, one entry per verified token (same length as
-        // ssm_state_indices). Absent for the linear chain path.
+        // Draft-tree rollback: page each token starts from, one per verified token (same len as ssm_state_indices).
         this->Input("init_state_indices")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_INT32, ge::DT_INT32})

@@ -1,29 +1,4 @@
-"""Per-request bookkeeping of the short-conv history hand-off.
-
-``AscendMambaHybridModelState`` remembers the accepted draft path of the previous
-step per request, so that the next tree step can rebuild its committed conv
-history from the node columns (see ``tests/ut/ops/test_gdn_tree_conv_handoff.py``
-for what that rebuild has to produce). The information is only meaningful for a
-request whose previous step actually ran the tree op, which the bookkeeping has
-to express explicitly:
-
-* ``postprocess_state`` invalidates the buffers for every request in the batch,
-  whether or not the tree sampler ran, so that a step the tree op did not handle
-  -- a prompt-only step, a row folded into a chunk -- cannot leave an older tree
-  step's path in place;
-* a row inside a spec batch that verified no draft token reports the neutral
-  ``num_sampled == 1`` with an all ``-1`` path, exactly like a tree step that
-  accepted only its root, so ``tree_row_mask`` decides from the verified token
-  count which of the two committed the row and stages ``0`` for the linear one;
-* a finished request's slot is reused by the next request only after
-  ``add_request`` cleared the buffers, so a fresh request's first tree step
-  cannot re-anchor from a foreign path;
-* ``get_extra_attn_kwargs`` pads the tree tables to the padded batch a FULL graph
-  replays with.
-
-``_reanchor_source`` mirrors the read side of the buffers: it applies exactly
-what the model state staged, nothing more.
-"""
+"""Which rows the tree op committed, so the next step re-anchors only those."""
 
 from types import SimpleNamespace
 
@@ -40,8 +15,7 @@ _NUM_SPEC = 3
 _BUDGET = 4  # wider than the draft chain, which the tree config allows
 _WIDTH = 4
 _SLOTS = 1 + _BUDGET
-# A linear step leaves the window the next root continues from in columns
-# ``0 .. width - 2``, so the re-anchor has to be the identity there.
+# A linear step leaves the next root's window in columns 0..width-2 (identity).
 _IDENTITY_SOURCE = [[0, 1, 2]]
 
 
@@ -75,8 +49,7 @@ def _model_state(tree_enabled, num_slots=1):
     )
 
     tree_enabled()
-    # Object.__new__: the tests drive the tree bookkeeping only, and every
-    # attribute it touches is set here.
+    # Object.__new__: only the tree bookkeeping is exercised, all attrs set here.
     state = object.__new__(AscendMambaHybridModelState)
     state.vllm_config = _config()
     state.num_accepted_tokens_gpu = torch.ones((num_slots,), dtype=torch.int32)
@@ -97,11 +70,7 @@ def _silence_super(monkeypatch):
 
 
 def _reanchor_source(state, row: int) -> torch.Tensor:
-    """The history columns the next tree step reads for ``row``.
-
-    Mirrors the only consumer of the buffers,
-    ``gdn_attn_builder._build_tree_conv_rows`` + ``compute_tree_prefix_source``.
-    """
+    """The history columns the next tree step reads for ``row``."""
     prev_path = state._tree_prev_path[row : row + 1].to(torch.int32)
     prev_num_sampled = state._tree_prev_num_sampled[row : row + 1].to(torch.int32)
     return compute_tree_prefix_source(prev_path, prev_num_sampled, _WIDTH)
@@ -114,12 +83,7 @@ def _accept(
     idx: torch.Tensor,
     is_tree_row: torch.Tensor | None = None,
 ) -> None:
-    """One step of the runner: stage the sampler output, then commit it.
-
-    ``is_tree_row`` defaults to "every staged row ran the tree op", which is what
-    a step whose sampler produced a path normally looks like; a test that models
-    a row the linear operator committed passes the mask explicitly.
-    """
+    """Stage the sampler output of one step, then commit it."""
     if is_tree_row is None:
         is_tree_row = torch.ones_like(num_sampled, dtype=torch.bool)
     state.stage_tree_resume_column(
@@ -141,8 +105,7 @@ def test_a_step_without_a_tree_path_does_not_reanchor_the_next_step(tree_enabled
     _accept(state, path, torch.tensor([3], dtype=torch.int32), idx)
     assert state._tree_prev_num_sampled[0].item() == 3
 
-    # Step 2: a prompt-only step (or any step the tree sampler never saw). The
-    # linear operator wrote the history, so the stale path must be dropped.
+    # Step 2: a prompt-only step, so the stale tree path must be dropped.
     state.postprocess_state(idx, torch.tensor([1], dtype=torch.int32))
 
     assert _reanchor_source(state, 0).tolist() == _IDENTITY_SOURCE, (
@@ -153,18 +116,15 @@ def test_a_step_without_a_tree_path_does_not_reanchor_the_next_step(tree_enabled
 
 
 def test_a_masked_entry_does_not_clobber_another_slot(tree_enabled, monkeypatch):
-    """``idx_mapping`` may carry ``-1``; indexing with it writes the last slot."""
     _silence_super(monkeypatch)
     state = _model_state(tree_enabled, num_slots=2)
-    # Both slots hold the accepted path of their own previous tree step.
     state._tree_prev_path = torch.zeros((2, _SLOTS - 1), dtype=torch.int32)
     state._tree_prev_num_sampled = torch.zeros((2,), dtype=torch.int32)
     state._tree_prev_path[0, :2] = torch.tensor([1, 2], dtype=torch.int32)
     state._tree_prev_path[1, :2] = torch.tensor([1, 2], dtype=torch.int32)
     state._tree_prev_num_sampled[:] = 3
 
-    # A step whose only entry is masked: no request was committed by it, so no
-    # path may change.
+    # A masked-only step: no request was committed, so no path may change.
     state.postprocess_state(torch.tensor([-1]), torch.tensor([0], dtype=torch.int32))
 
     assert state._tree_prev_num_sampled.tolist() == [3, 3], (
@@ -180,12 +140,9 @@ def test_a_row_without_draft_tokens_does_not_reanchor_the_next_step(tree_enabled
     idx = torch.tensor([0])
     path = torch.tensor([[1, 2, -1, -1]], dtype=torch.int32)
 
-    # Step 1: decoded with the tree.
     _accept(state, path, torch.tensor([3], dtype=torch.int32), idx)
 
-    # Step 2: the scheduler gave this row no draft tokens, so the linear
-    # operator ran; the sampler still reports its trailing resample, and the
-    # verified token count says the tree op never saw the row.
+    # Step 2: no draft tokens for this row, so the linear operator ran.
     no_path = torch.full((1, _BUDGET), -1, dtype=torch.int32)
     neutral = torch.tensor([1], dtype=torch.int32)
     _accept(state, no_path, neutral, idx, is_tree_row=torch.tensor([False]))
@@ -198,17 +155,14 @@ def test_a_row_without_draft_tokens_does_not_reanchor_the_next_step(tree_enabled
 
 
 def test_a_root_only_tree_step_still_reanchors_from_its_node(tree_enabled, monkeypatch):
-    """The control for the row above: the same 1/-1 report, but tree committed."""
     _silence_super(monkeypatch)
     state = _model_state(tree_enabled)
     idx = torch.tensor([0])
     path = torch.tensor([[1, 2, -1, -1]], dtype=torch.int32)
 
-    # Step 1: decoded with the tree.
     _accept(state, path, torch.tensor([3], dtype=torch.int32), idx)
 
-    # Step 2: a tree step that rejected every draft token. Its own tokens are in
-    # the node columns, so the next step has to rebuild from the root node.
+    # Step 2: a tree step that rejected every draft token.
     no_path = torch.full((1, _BUDGET), -1, dtype=torch.int32)
     neutral = torch.tensor([1], dtype=torch.int32)
     _accept(state, no_path, neutral, idx, is_tree_row=torch.tensor([True]))
@@ -236,8 +190,8 @@ def test_graph_replay_reuses_the_captured_treewy_context_dictionary():
     captured_contexts = state.attn_metadata["layer"].spec_decode_metadata.treewy_contexts
     captured_contexts["layer"] = object()
 
-    # Runtime metadata is newly built on each iteration; the state-commit
-    # phase still needs the static intermediates recorded by graph capture.
+    # Runtime metadata is rebuilt each iteration; state-commit needs the captured
+    # intermediates.
     state.attn_metadata = {"layer": metadata()}
     state._bind_treewy_contexts(CUDAGraphMode.FULL, 2, 10, for_capture=False)
     replay_contexts = state.attn_metadata["layer"].spec_decode_metadata.treewy_contexts
@@ -302,9 +256,6 @@ def test_treewy_state_cursor_stays_on_its_single_recurrent_page(monkeypatch):
 
 
 def test_tree_row_mask_follows_the_verified_token_count():
-    """``tree_row_mask`` is the runner's decision, so pin its three cases."""
-    # A single-token row (a decode the scheduler gave no draft token): the
-    # linear operator commits it.
     assert tree_row_mask(
         torch.tensor([1], dtype=torch.int32), torch.tensor([0], dtype=torch.int32)
     ).tolist() == [False]
@@ -329,7 +280,6 @@ def test_a_reused_slot_does_not_inherit_the_tree_path(tree_enabled, monkeypatch)
     )
 
     state = _model_state(tree_enabled)
-    # Left over from the request that used this slot before.
     state._tree_prev_path = torch.zeros((1, _SLOTS - 1), dtype=torch.int32)
     state._tree_prev_num_sampled = torch.zeros((1,), dtype=torch.int32)
     state._tree_prev_path[0, :2] = torch.tensor([1, 2], dtype=torch.int32)
@@ -345,7 +295,6 @@ def test_a_reused_slot_does_not_inherit_the_tree_path(tree_enabled, monkeypatch)
 
 
 def test_tree_metadata_pads_the_padded_rows_for_the_builder():
-    """Full-graph padding: the builder indexes the tree tables by batch row."""
     from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
     from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
         AscendMambaHybridAttnMetadata,
@@ -358,7 +307,6 @@ def test_tree_metadata_pads_the_padded_rows_for_the_builder():
         # The runner copies the tree layout of the real requests only.
         tree_parents=torch.tensor([[0, 0], [0, 1]], dtype=torch.long),
         tree_num_nodes=torch.tensor([2, 2], dtype=torch.int32),
-        # Already batch sized, the way prepare_attn builds them.
         tree_prev_path=torch.zeros((num_reqs, _SLOTS - 1), dtype=torch.int32),
         tree_prev_num_sampled=torch.zeros((num_reqs,), dtype=torch.int32),
     )
