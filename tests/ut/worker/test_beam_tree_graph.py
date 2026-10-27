@@ -40,6 +40,8 @@ def load_speculator(torch):
         "graph_capture": lambda **kwargs: nullcontext(),
         "torch_cuda_wrapper": nullcontext,
         "ensure_finalize_scratch": Mock(),
+        "tree_time": sys.modules["vllm_ascend.worker.v2.spec_decode.tree.timer"].tree_time,
+        "tree_stat": sys.modules["vllm_ascend.worker.v2.spec_decode.tree.timer"].tree_stat,
     }
     exec(compile(ast.fix_missing_locations(isolated), str(path), "exec"), namespace)
     return namespace["Speculator"]()
@@ -52,10 +54,11 @@ class TestBeamTreeGraph(unittest.TestCase):
         self.torch.npu.graph.side_effect = lambda *args, **kwargs: nullcontext()
         self.torch.npu.NPUGraph.side_effect = lambda: Mock()
         self.timer = Mock(side_effect=lambda *args: nullcontext())
+        self.stat = Mock()
         self.validate = Mock()
         modules = {
             "vllm_ascend.worker.v2.spec_decode.tree.timer": SimpleNamespace(
-                tree_time=self.timer
+                tree_time=self.timer, tree_stat=self.stat
             ),
             "vllm.compilation.monitor": SimpleNamespace(
                 validate_cudagraph_capturing_enabled=self.validate
@@ -132,6 +135,7 @@ class TestBeamTreeGraph(unittest.TestCase):
         self.spec._run_beam_finalize = Mock()
         self.spec._finalize_tree(3)
         self.spec._run_beam_finalize.assert_called_once_with(3, graph_safe=False)
+        self.stat.assert_called_once_with("beam_eager_reqs_3")
 
     def test_tensor_parallel_capture_failure_is_not_rank_local_fallback(self):
         self.spec.vllm_config.parallel_config.tensor_parallel_size = 2
@@ -150,6 +154,24 @@ class TestBeamTreeGraph(unittest.TestCase):
         self.spec._run_beam_finalize.assert_not_called()
         self.spec._load_layout_from_buffers.assert_called_once_with(2)
         self.assertIs(self.spec.tree, self.spec._load_layout_from_buffers.return_value)
+        self.stat.assert_called_once_with("beam_graph_replay_reqs_2")
+
+    def test_state_strategy_does_not_change_beam_graph_dispatch(self):
+        for strategy in ("snapshot", "treewy"):
+            with self.subTest(strategy=strategy):
+                # Beam dispatch shares the same implementation across both strategies.
+                self.spec.vllm_config.additional_config = {
+                    "tree_spec_config": {"gdn_state_update": strategy}
+                }
+                graph = Mock()
+                self.spec._beam_graphs = {1: graph}
+                self.spec._run_beam_finalize = Mock()
+                self.spec._tree_finalized = False
+                self.stat.reset_mock()
+                self.spec._finalize_tree(1)
+                graph.replay.assert_called_once()
+                self.spec._run_beam_finalize.assert_not_called()
+                self.stat.assert_called_once_with("beam_graph_replay_reqs_1")
 
     def test_finalize_captures_logits_and_passes_graph_safe_without_timer(self):
         self.spec.num_speculative_steps = 7

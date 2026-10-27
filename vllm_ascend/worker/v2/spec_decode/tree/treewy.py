@@ -10,9 +10,12 @@ functions are slow, synchronizing test oracles; the tensor-only ones are the cur
 Ascend execution path until a fused operator lands.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
+
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_stat, tree_time
 
 
 @dataclass(frozen=True)
@@ -504,6 +507,150 @@ def treewy_verify_torch(
     return TreeWYVerificationResult(output, pseudo_values, log_decay, ancestors)
 
 
+@dataclass(frozen=True)
+class TreeWYCommitPlan:
+    """Layer-independent commit inputs of one batch.
+
+    The draft tree, the accepted path and the ancestor weights are the same for every GDN
+    layer, so they are resolved once per batch instead of once per layer: a hybrid model with
+    48 recurrent layers otherwise repeated this work (and its ~25 small kernels) 48 times.
+    Only the per-layer tensors stay in :func:`treewy_commit_layer_torch`.
+    """
+
+    rows: int
+    slots: int
+    value_heads: int
+    token_indices: torch.Tensor | None
+    valid_nodes: torch.Tensor
+    key_head_index: torch.Tensor
+    accepted_index: torch.Tensor
+    ancestor_weights: torch.Tensor
+    active_rows: torch.Tensor
+    row_ids: torch.Tensor
+
+
+def treewy_map_commit_rows(
+    sequence_indices: torch.Tensor,
+    path_node_ids: torch.Tensor,
+    num_sampled: torch.Tensor,
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-metadata-row sampler output, ``[rows]`` and ``[rows, path width]``.
+
+    Metadata rows are op rows (padded graph batches included) while the sampler only returns
+    real requests, so each row is mapped through ``sequence_indices``; rows outside the
+    sampler batch are marked with ``num_sampled = -1`` and an all ``-1`` path, which keeps
+    them out of the commit even when their row is a linear (folded prompt) chain.
+    """
+    request_count = min(path_node_ids.shape[0], num_sampled.shape[0])
+    if request_count == 0:
+        return (
+            torch.full((rows,), -1, dtype=torch.int32, device=num_sampled.device),
+            torch.full((rows, path_node_ids.shape[1]), -1, dtype=torch.long, device=path_node_ids.device),
+        )
+    row_indices = sequence_indices.to(torch.long)
+    valid_rows = (row_indices >= 0) & (row_indices < request_count)
+    safe_row_indices = row_indices.clamp(min=0, max=request_count - 1)
+    sampled = num_sampled.index_select(0, safe_row_indices)
+    sampled = torch.where(valid_rows, sampled, torch.full_like(sampled, -1))
+    accepted_path = path_node_ids.index_select(0, safe_row_indices).to(torch.long)
+    accepted_path = accepted_path.masked_fill(~valid_rows[:, None], -1)
+    return sampled, accepted_path
+
+
+def treewy_commit_plan(
+    tree_parents: torch.Tensor,
+    tree_num_nodes: torch.Tensor | None,
+    row_widths: torch.Tensor,
+    sampled: torch.Tensor,
+    accepted_path: torch.Tensor,
+    value_heads: int,
+    key_heads: int,
+    token_count: int,
+    *,
+    ancestors: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> TreeWYCommitPlan:
+    """Prepare the accepted path and its weights, shared by every layer of the batch.
+
+    ``sampled``/``accepted_path`` are already row-mapped by :func:`treewy_map_commit_rows`.
+    Shapes depend only on the tree layout, so the result is safe to build once and reuse
+    inside a captured graph.
+    """
+    rows, parent_columns = tree_parents.shape
+    slots = parent_columns + 1
+    if device is None:
+        device = tree_parents.device
+    widths = row_widths.to(device=device)
+    token_indices, valid_nodes = _tree_token_indices(widths, slots, token_count)
+    sampled = sampled.to(device=device, dtype=torch.long)
+    accepted_path = accepted_path.to(device=device, dtype=torch.long)
+    if ancestors is None:
+        _, ancestors = _tree_parent_and_ancestor_tensors(tree_parents, tree_num_nodes, slots)
+    chain_rows = torch.zeros_like(sampled, dtype=torch.bool)
+    if tree_num_nodes is not None:
+        chain_rows = tree_num_nodes.to(device=device) == 0
+    with tree_time("gdn_commit_select_path"):
+        if accepted_path.shape[1] > 0:
+            path_index = (sampled - 2).clamp(min=0, max=accepted_path.shape[1] - 1)
+            last_path_node = accepted_path.gather(1, path_index[:, None]).squeeze(1)
+        else:
+            last_path_node = torch.zeros_like(sampled)
+        accepted_nodes = torch.where(sampled >= 2, last_path_node, torch.zeros_like(sampled))
+        chain_node = torch.where(sampled > 0, sampled - 1, widths - 1)
+        accepted_nodes = torch.where(chain_rows, chain_node, accepted_nodes)
+        accepted_nodes = accepted_nodes.clamp(min=0, max=slots - 1)
+        accepted_ancestors = ancestors.gather(
+            1, accepted_nodes[:, None, None].expand(rows, 1, slots)
+        ).squeeze(1)
+    group_size = value_heads // key_heads
+    return TreeWYCommitPlan(
+        rows=rows,
+        slots=slots,
+        value_heads=value_heads,
+        token_indices=token_indices,
+        valid_nodes=valid_nodes,
+        key_head_index=torch.arange(value_heads, device=device) // group_size,
+        accepted_index=accepted_nodes[:, None, None].expand(rows, 1, value_heads),
+        ancestor_weights=(accepted_ancestors & valid_nodes),
+        # ``sampled < 0`` marks a row the sampler never returned (:func:`treewy_map_commit_rows`),
+        # which must stay out even when it is a folded prompt chain.
+        active_rows=(((sampled > 0) | chain_rows) & (widths > 0)) & (sampled >= 0),
+        row_ids=torch.arange(rows, dtype=torch.long, device=device),
+    )
+
+
+def treewy_commit_layer_torch(
+    plan: TreeWYCommitPlan,
+    key: torch.Tensor,
+    pseudo_values: torch.Tensor,
+    log_decay: torch.Tensor,
+    initial_state: torch.Tensor,
+) -> torch.Tensor:
+    """Rebuild one layer's accepted state, ``[rows, heads, value, key]``, in float.
+
+    Reads only device tensors whose shapes come from ``plan``, so the same call can run
+    eager or inside a captured graph.
+    """
+    rows, slots = plan.rows, plan.slots
+    with tree_time("gdn_commit_pack"):
+        key_grid = _packed_tokens_to_tree_grid(key, plan.token_indices, plan.valid_nodes, rows, slots)
+        pseudo_grid = _packed_tokens_to_tree_grid(pseudo_values, plan.token_indices, plan.valid_nodes, rows, slots)
+        key_grid = key_grid.index_select(2, plan.key_head_index).float()
+    with tree_time("gdn_commit_weights"):
+        initial_float = initial_state.float()
+        accepted_log_decay = log_decay.gather(1, plan.accepted_index).squeeze(1)
+        state = accepted_log_decay.exp()[:, :, None, None] * initial_float
+        # Apply all accepted rank-one updates in one batched matmul, not one [R,H,V,K] rewrite per node.
+        ratio = (accepted_log_decay[:, None] - log_decay.float()).clamp(max=0.0).exp()
+        coefficient = ratio * plan.ancestor_weights[:, :, None]
+        weighted_pseudo = (coefficient[:, :, :, None] * pseudo_grid.float()).permute(0, 2, 3, 1)
+    with tree_time("gdn_commit_matmul"):
+        state = state + torch.matmul(weighted_pseudo, key_grid.permute(0, 2, 1, 3))
+    with tree_time("gdn_commit_mask"):
+        return torch.where(plan.active_rows[:, None, None, None], state, initial_float)
+
+
 def treewy_commit_torch(
     initial_state: torch.Tensor,
     key: torch.Tensor,
@@ -522,49 +669,88 @@ def treewy_commit_torch(
     ``initial_state`` is the committed state at the start of verification; rows with no
     sampled token or no verified node keep it unchanged.
     """
-    rows, parent_columns = tree_parents.shape
-    slots = parent_columns + 1
-    token_indices, valid_nodes = _tree_token_indices(row_widths.to(device=key.device), slots, key.shape[0])
-    key_grid = _packed_tokens_to_tree_grid(key, token_indices, valid_nodes, rows, slots)
-    pseudo_grid = _packed_tokens_to_tree_grid(pseudo_values, token_indices, valid_nodes, rows, slots)
-    value_heads = initial_state.shape[1]
-    key_heads = key.shape[1]
-    group_size = value_heads // key_heads
-    value_to_key_heads = torch.arange(value_heads, device=key.device) // group_size
-    key_grid = key_grid.index_select(2, value_to_key_heads).float()
-    if ancestors is None:
-        _, ancestors = _tree_parent_and_ancestor_tensors(tree_parents, tree_num_nodes, slots)
+    plan = treewy_commit_plan(
+        tree_parents,
+        tree_num_nodes,
+        row_widths,
+        num_sampled,
+        path_node_ids,
+        initial_state.shape[1],
+        key.shape[1],
+        key.shape[0],
+        ancestors=ancestors,
+        device=key.device,
+    )
+    return treewy_commit_layer_torch(plan, key, pseudo_values, log_decay, initial_state).to(
+        initial_state.dtype
+    )
 
-    sampled = num_sampled.to(device=initial_state.device, dtype=torch.long)
-    if path_node_ids.shape[1] > 0:
-        path_index = (sampled - 2).clamp(min=0, max=path_node_ids.shape[1] - 1)
-        last_path_node = path_node_ids.to(torch.long).gather(1, path_index[:, None]).squeeze(1)
-    else:
-        last_path_node = torch.zeros_like(sampled)
-    chain_rows = torch.zeros_like(sampled, dtype=torch.bool)
-    if tree_num_nodes is not None:
-        chain_rows = tree_num_nodes.to(device=sampled.device) == 0
-    accepted_nodes = torch.where(sampled >= 2, last_path_node, torch.zeros_like(sampled))
-    chain_node = torch.where(sampled > 0, sampled - 1, row_widths.to(sampled.device) - 1)
-    accepted_nodes = torch.where(chain_rows, chain_node, accepted_nodes)
-    accepted_nodes = accepted_nodes.clamp(min=0, max=slots - 1)
 
-    accepted_ancestors = ancestors.gather(
-        1, accepted_nodes[:, None, None].expand(rows, 1, slots)
-    ).squeeze(1)
-    accepted_log_decay = log_decay.gather(
-        1, accepted_nodes[:, None, None].expand(rows, 1, value_heads)
-    ).squeeze(1)
-    state = accepted_log_decay.exp()[:, :, None, None] * initial_state.float()
-    # Apply all accepted rank-one updates in one batched matmul, not one [R,H,V,K] rewrite per node.
-    ratio = (accepted_log_decay[:, None] - log_decay.float()).clamp(max=0.0).exp()
-    coefficient = ratio * (accepted_ancestors & valid_nodes)[:, :, None]
-    weighted_pseudo = (coefficient[:, :, :, None] * pseudo_grid.float()).permute(0, 2, 3, 1)
-    state = state + torch.matmul(weighted_pseudo, key_grid.permute(0, 2, 1, 3))
+def treewy_scatter_commit_state(
+    plan: TreeWYCommitPlan,
+    context: TreeWYLayerContext,
+    state: torch.Tensor,
+) -> None:
+    """Write the rebuilt state into this layer's pages, without a data-dependent shape.
 
-    active_rows = ((sampled > 0) | chain_rows) & (row_widths.to(device=sampled.device) > 0)
-    state = torch.where(active_rows[:, None, None, None], state, initial_state.float())
-    return state.to(initial_state.dtype)
+    Rows the sampler skipped (padded graph rows, folded prompt chunks) must leave their page
+    untouched. Several rows may address one page -- a padded row is clamped onto
+    ``NULL_BLOCK_ID`` -- and a state scatter with repeated indices is order dependent, so every
+    writer of one page is given the same value first: the reconstruction of a row that
+    accepted a path, or the page's own current content when no row did (a no-op write).
+    """
+    pages = context.root_state_indices.to(torch.long)
+    with tree_time("gdn_commit_writeback"):
+        if plan.rows == 1:
+            values = state
+        else:
+            same_page = pages.unsqueeze(1) == pages.unsqueeze(0)
+            # Highest row id per page among the rows that commit, -1 where no row commits.
+            writer = torch.where(
+                same_page & plan.active_rows.unsqueeze(0), plan.row_ids.unsqueeze(0), -1
+            ).amax(dim=1)
+            commits = writer >= 0
+            source = torch.where(commits, writer, plan.row_ids).clamp(min=0)
+            values = torch.where(
+                commits[:, None, None, None],
+                state.index_select(0, source),
+                context.state.index_select(0, pages).float(),
+            )
+        context.state.index_copy_(0, pages, values.to(context.state.dtype))
+
+
+def treewy_commit_layers_torch(
+    plan: TreeWYCommitPlan,
+    layer_contexts: Iterable[TreeWYLayerContext],
+) -> None:
+    """Commit every layer that shares ``plan``, in place.
+
+    This is the whole captured-region body: a plan built once per batch, then one
+    reconstruction and one page write per layer.
+    """
+    for context in layer_contexts:
+        with tree_time("gdn_commit_reconstruct"):
+            accepted_state = treewy_commit_layer_torch(
+                plan,
+                context.key,
+                context.pseudo_values,
+                context.log_decay,
+                context.initial_state,
+            )
+        treewy_scatter_commit_state(plan, context, accepted_state)
+
+
+def _commit_layout(context: TreeWYLayerContext) -> tuple:
+    """Identity of the batch-wide tensors a commit plan is built from."""
+    return (
+        id(context.tree_parents),
+        id(context.tree_num_nodes),
+        id(context.row_widths),
+        id(context.sequence_indices),
+        id(context.ancestors),
+        context.initial_state.shape[1],
+        context.key.shape[0],
+    )
 
 
 def treewy_commit_contexts_torch(
@@ -573,33 +759,32 @@ def treewy_commit_contexts_torch(
     num_sampled: torch.Tensor,
 ) -> None:
     """Commit the accepted recurrent state for each GDN layer in place."""
+    tree_stat("gdn_commit_layers", len(contexts))
+    request_count = min(path_node_ids.shape[0], num_sampled.shape[0])
+    if request_count == 0 or not contexts:
+        return
+    groups: dict[tuple, list[TreeWYLayerContext]] = {}
     for context in contexts.values():
-        row_indices = context.sequence_indices.to(torch.long)
-        request_count = min(path_node_ids.shape[0], num_sampled.shape[0])
-        if request_count == 0:
-            continue
-        valid_rows = (row_indices >= 0) & (row_indices < request_count)
-        safe_row_indices = row_indices.clamp(min=0, max=request_count - 1)
-        sampled = num_sampled.index_select(0, safe_row_indices)
-        sampled = torch.where(valid_rows, sampled, torch.zeros_like(sampled))
-        accepted_path = path_node_ids.index_select(0, safe_row_indices)
-        accepted_path = accepted_path.masked_fill(~valid_rows[:, None], -1)
-        accepted_state = treewy_commit_torch(
-            context.initial_state,
-            context.key,
-            context.pseudo_values,
-            context.log_decay,
+        groups.setdefault(_commit_layout(context), []).append(context)
+    for layers in groups.values():
+        context = layers[0]
+        with tree_time("gdn_commit_map_requests"):
+            sampled, accepted_path = treewy_map_commit_rows(
+                context.sequence_indices,
+                path_node_ids,
+                num_sampled,
+                context.initial_state.shape[0],
+            )
+        plan = treewy_commit_plan(
             context.tree_parents,
-            context.row_widths,
-            accepted_path,
-            sampled,
             context.tree_num_nodes,
+            context.row_widths,
+            sampled,
+            accepted_path,
+            context.initial_state.shape[1],
+            context.key.shape[1],
+            context.key.shape[0],
             ancestors=context.ancestors,
+            device=context.key.device,
         )
-        chain_rows = context.tree_num_nodes == 0
-        # FULL graphs may carry padded rows with a full verify width, though the sampler
-        # only returns real requests; a padded row can map to a reused state page, so its
-        # synthetic chain result must never overwrite a real request's committed state.
-        active = valid_rows & ((sampled > 0) | chain_rows) & (context.row_widths > 0)
-        pages = context.root_state_indices.to(torch.long)[active]
-        context.state.index_copy_(0, pages, accepted_state[active])
+        treewy_commit_layers_torch(plan, layers)

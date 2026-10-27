@@ -103,6 +103,14 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     _tree_prev_num_sampled: torch.Tensor | None = None
     _tree_commit_graphs: dict[tuple[int, int], Any]
     _tree_commit_graph_failures: set[tuple[int, int]]
+    # Layer set whose TreeWY intermediates were written by a captured graph; ``None`` disables
+    # the commit graph for this step (eager verification, uncaptured batch shape, recapture).
+    _treewy_commit_token: tuple[dict, int] | None = None
+    _treewy_graph_epoch: int = 0
+    _treewy_captured_keys: dict[tuple[str, int, int], int]
+    _treewy_commit_graphs: dict[tuple, Any]
+    _treewy_commit_graph_failures: set[tuple]
+    _treewy_commit_buffers: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         """Reset the tree-side bookkeeping of a request slot."""
@@ -239,6 +247,230 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             )
             return False
 
+    def _treewy_commit_inputs(
+        self,
+        rows: int,
+        path_width: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stable row-mapped sampler inputs, one pair per batch shape.
+
+        A replay reads them by address, so they are kept per shape instead of reallocated when
+        the runner alternates between captured batch sizes.
+        """
+        buffers = getattr(self, "_treewy_commit_buffers", None)
+        if not isinstance(buffers, dict):
+            buffers = self._treewy_commit_buffers = {}
+        pair = buffers.get((rows, path_width))
+        if pair is None or pair[0].device != device:
+            pair = (
+                torch.empty((rows, path_width), dtype=torch.long, device=device),
+                torch.empty((rows,), dtype=torch.int32, device=device),
+            )
+            buffers[(rows, path_width)] = pair
+        return pair
+
+    def _run_treewy_commit_graph(
+        self,
+        layer_contexts: dict[str, Any],
+        path: torch.Tensor,
+        num_sampled: torch.Tensor,
+        *,
+        bookkeeping: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    ) -> bool:
+        """Replay one ACLGraph that commits every GDN layer's accepted state.
+
+        Verification runs inside the model graph, so each layer's ``key``, ``pseudo_values``,
+        ``log_decay`` and grabbed initial state live at captured addresses that only a replay
+        refreshes. One graph therefore turns the eager tail of the decode step -- one
+        ``treewy_commit_torch`` per GDN layer, 48 of them on a hybrid model -- into a single
+        launch. Only the sampler output changes per step, so it is copied into stable buffers
+        first; everything else is read from the capture. When eligible, the same launch also
+        saves the request histories and resets the single-page TreeWY cursor.
+        """
+        token = getattr(self, "_treewy_commit_token", None)
+        # Only a layer set produced by a captured graph is replayable; see _bind_treewy_contexts.
+        if token is None or token[0] is not layer_contexts or not layer_contexts:
+            return False
+        if not isinstance(path, torch.Tensor) or not isinstance(num_sampled, torch.Tensor):
+            return False
+        if path.ndim != 2 or num_sampled.ndim != 1:
+            return False
+        if num_sampled.device != path.device:
+            return False
+        if not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
+            return False
+        if hasattr(torch.npu, "is_current_stream_capturing") and torch.npu.is_current_stream_capturing():
+            return False
+        first = next(iter(layer_contexts.values()))
+        rows = first.row_widths.shape[0]
+        if rows <= 0 or first.key.device != path.device:
+            return False
+
+        from vllm_ascend.worker.v2.spec_decode.tree.treewy import (
+            treewy_commit_layers_torch,
+            treewy_commit_plan,
+            treewy_map_commit_rows,
+        )
+
+        graphs = getattr(self, "_treewy_commit_graphs", None)
+        if graphs is None:
+            graphs = self._treewy_commit_graphs = {}
+        failures = getattr(self, "_treewy_commit_graph_failures", None)
+        if failures is None:
+            failures = self._treewy_commit_graph_failures = set()
+        epoch = token[1]
+        bookkeeping_key = None
+        bookkeeping_inputs = None
+        if bookkeeping is not None:
+            idx_mapping, is_tree_row = bookkeeping
+            prev_path, prev_num_sampled = self._tree_buffers(path.device)
+            assert path.shape[1] <= prev_path.shape[1], "accepted path exceeds the tree budget"
+            bookkeeping_key = (
+                idx_mapping.shape[0],
+                idx_mapping.dtype,
+                prev_path.data_ptr(),
+                prev_num_sampled.data_ptr(),
+                self.num_accepted_tokens_gpu.data_ptr(),
+            )
+        graph_key = (id(layer_contexts), epoch, rows, path.shape[1])
+        if bookkeeping_key is not None:
+            graph_key += (bookkeeping_key,)
+        path_buffer, sampled_buffer = self._treewy_commit_inputs(rows, path.shape[1], path.device)
+        sampled, accepted_path = treewy_map_commit_rows(
+            first.sequence_indices, path, num_sampled, rows
+        )
+        path_buffer.copy_(accepted_path)
+        sampled_buffer.copy_(sampled)
+
+        entry = graphs.get(graph_key)
+        if bookkeeping is not None:
+            if entry is not None:
+                bookkeeping_inputs = entry[5]
+            else:
+                bookkeeping_inputs = (
+                    torch.empty_like(idx_mapping),
+                    torch.empty_like(path, dtype=prev_path.dtype),
+                    torch.empty_like(num_sampled, dtype=prev_num_sampled.dtype),
+                    torch.empty_like(num_sampled, dtype=torch.bool),
+                )
+            idx_buffer, history_path, history_sampled, history_tree_mask = bookkeeping_inputs
+            idx_buffer.copy_(idx_mapping)
+            history_path.copy_(path)
+            history_sampled.copy_(num_sampled)
+            if is_tree_row is None:
+                history_tree_mask.fill_(True)
+            else:
+                history_tree_mask.copy_(is_tree_row)
+        fingerprint = (
+            len(layer_contexts),
+            id(first.key),
+            id(first.pseudo_values),
+            id(first.initial_state),
+        )
+        if entry is not None:
+            if entry[1] != fingerprint:
+                # An eager forward replaced the captured intermediates; the recorded addresses
+                # no longer describe this batch, so drop the graph and stay eager.
+                graphs.pop(graph_key, None)
+                failures.add(graph_key)
+                return False
+            entry[0].replay()
+            return True
+        if graph_key in failures:
+            return False
+
+        try:
+            from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+            from vllm.platforms import current_platform
+
+            validate_cudagraph_capturing_enabled()
+
+            def commit_ops():
+                # Rebuilt inside the captured region: the accepted node and weight tensors are
+                # derived from the sampler buffers, so a replay must recompute them, not reuse
+                # the values this step happened to produce.
+                plan = treewy_commit_plan(
+                    first.tree_parents,
+                    first.tree_num_nodes,
+                    first.row_widths,
+                    sampled_buffer,
+                    path_buffer,
+                    first.initial_state.shape[1],
+                    first.key.shape[1],
+                    first.key.shape[0],
+                    ancestors=first.ancestors,
+                    device=first.key.device,
+                )
+                treewy_commit_layers_torch(plan, layer_contexts.values())
+                if bookkeeping_inputs is not None:
+                    self._commit_treewy_bookkeeping(*bookkeeping_inputs, prev_path, prev_num_sampled)
+                return plan
+
+            pool = current_platform.get_global_graph_pool()
+            with torch.inference_mode():
+                # Capture records without executing, so commit this step eagerly first; it also
+                # warms the allocator. A failure below re-runs the eager loop, which is
+                # idempotent because the reconstruction reads the verify-time initial state.
+                commit_ops()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph, pool=pool):
+                    plan = commit_ops()
+            for stale in [key for key in graphs if key[0] == graph_key[0] and key[1] != epoch]:
+                # A recaptured model graph replaced this layer set; its commit graph is dead.
+                graphs.pop(stale, None)
+            # Keep the plan: it owns the captured intermediates a replay reads.
+            graphs[graph_key] = (graph, fingerprint, plan, path_buffer, sampled_buffer, bookkeeping_inputs)
+            logger.info(
+                "Captured TreeWY state-commit ACLGraph rows=%s layers=%s path=%s bookkeeping=%s",
+                rows,
+                len(layer_contexts),
+                path.shape[1],
+                bookkeeping_inputs is not None,
+            )
+            return True
+        except Exception as exc:
+            failures.add(graph_key)
+            logger.warning(
+                "TreeWY state-commit ACLGraph failed for rows=%s layers=%s; using eager. %s",
+                rows,
+                len(layer_contexts),
+                exc,
+            )
+            return False
+
+    def _commit_treewy_bookkeeping(
+        self,
+        idx_mapping: torch.Tensor,
+        path: torch.Tensor,
+        num_sampled: torch.Tensor,
+        is_tree_row: torch.Tensor,
+        prev_path: torch.Tensor,
+        prev_num_sampled: torch.Tensor,
+    ) -> None:
+        """Fixed-shape writes for valid, unique request indices in a non-PP batch."""
+        idx_mapping = idx_mapping.to(torch.int64)
+        prev_path[:, : path.shape[1]].index_copy_(0, idx_mapping, path)
+        prev_num_sampled.index_copy_(0, idx_mapping, torch.where(is_tree_row, num_sampled, 0))
+        self.num_accepted_tokens_gpu.index_fill_(0, idx_mapping, 1)
+
+    def _can_fuse_treewy_bookkeeping(self, idx_mapping: torch.Tensor) -> bool:
+        """Leave upstream recovery/alignment and PP sentinel handling on their eager paths."""
+        return (
+            getattr(self, "_treewy_state_layout", False)
+            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self.recoverssm is None
+            and not self._align_mode
+            and self._tree_path is not None
+            and self._tree_num_sampled is not None
+            and idx_mapping.ndim == 1
+            and idx_mapping.shape[0] > 0
+            and self._tree_path.shape[0] == idx_mapping.shape[0]
+            and self._tree_num_sampled.shape[0] == idx_mapping.shape[0]
+            and idx_mapping.device == self._tree_path.device
+            and (self._tree_is_tree_row is None or self._tree_is_tree_row.shape == idx_mapping.shape)
+        )
+
     def _bind_treewy_contexts(
         self,
         cudagraph_mode: CUDAGraphMode,
@@ -269,6 +501,23 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             if for_capture:
                 # A graph can be recaptured; drop references to the old static outputs first.
                 graph_contexts.clear()
+                # Those tensors were just replaced, so any commit graph captured for the
+                # previous addresses is stale: a fresh epoch forces a fresh capture.
+                epoch = getattr(self, "_treewy_graph_epoch", 0) + 1
+                self._treewy_graph_epoch = epoch
+                captured_keys = getattr(self, "_treewy_captured_keys", None)
+                if captured_keys is None:
+                    captured_keys = self._treewy_captured_keys = {}
+                captured_keys[key] = epoch
+
+        # Only a shape whose verification was captured feeds the commit graph: an eager forward
+        # allocates fresh intermediates whose addresses a replay would not refresh. Piecewise
+        # pieces are left eager: their per-piece static inputs are not this layer-set's.
+        self._treewy_commit_token = None
+        if graph_kind == "full":
+            epoch = getattr(self, "_treewy_captured_keys", {}).get(key)
+            if epoch is not None:
+                self._treewy_commit_token = (graph_contexts, epoch)
 
         contexts_to_commit = []
         seen_metadata = set()
@@ -294,7 +543,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
-        # Times path writes/clears and the accepted-cursor scatter only; no fences when disabled.
+        # Includes TreeWY reconstruction, path writes/clears and the accepted-cursor scatter.
         if tree_timer_enabled() and (self._tree_path is not None or self._tree_prev_path is not None):
             with tree_time("gdn_state_commit"):
                 self._postprocess_state_impl(idx_mapping, num_sampled, num_computed_tokens)
@@ -308,19 +557,41 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         contexts_to_commit = getattr(self, "_treewy_contexts_to_commit", None)
+        bookkeeping_done = False
+        fuse_bookkeeping = self._can_fuse_treewy_bookkeeping(idx_mapping)
         if self._tree_path is not None and self._tree_num_sampled is not None and contexts_to_commit:
             from vllm_ascend.worker.v2.spec_decode.tree.treewy import (
                 treewy_commit_contexts_torch,
             )
 
-            for contexts in contexts_to_commit:
-                if contexts:
-                    treewy_commit_contexts_torch(
+            with tree_time("gdn_treewy_commit_total"):
+                for contexts in contexts_to_commit:
+                    if not contexts:
+                        continue
+                    if not self._run_treewy_commit_graph(
                         contexts,
                         self._tree_path,
                         self._tree_num_sampled,
-                    )
+                        bookkeeping=(
+                            (idx_mapping, self._tree_is_tree_row)
+                            if fuse_bookkeeping and not bookkeeping_done
+                            else None
+                        ),
+                    ):
+                        treewy_commit_contexts_torch(
+                            contexts,
+                            self._tree_path,
+                            self._tree_num_sampled,
+                        )
+                    elif fuse_bookkeeping:
+                        bookkeeping_done = True
         self._treewy_contexts_to_commit = []
+        if bookkeeping_done:
+            self._tree_resume_column = None
+            self._tree_path = None
+            self._tree_num_sampled = None
+            self._tree_is_tree_row = None
+            return
 
         # Snapshot pages resume at the last accepted node; TreeWY rebuilds it into its sole page.
         if self._tree_resume_column is not None:

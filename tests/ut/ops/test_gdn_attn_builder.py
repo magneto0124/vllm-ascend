@@ -1390,6 +1390,40 @@ def test_snapshot_tree_state_table_graph_replay_refreshes_stable_inputs():
     assert all(not torch.equal(before, after) for before, after in zip(first_values, second))
 
 
+def test_treewy_metadata_refreshes_topology_history_and_keeps_output_addresses():
+    builder = object.__new__(AscendGDNAttentionMetadataBuilder)
+    builder.spec_tree_slots = 4
+    builder.spec_conv_width = 4
+    builder.spec_tree_parents = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int32)
+    builder.spec_tree_num_nodes = torch.tensor([3, 3], dtype=torch.int32)
+    builder.spec_tree_ancestors = torch.empty((2, 4, 4), dtype=torch.bool)
+    builder.spec_conv_window_rows = torch.empty((8, 4), dtype=torch.int32)
+    builder.spec_conv_prefix_src = torch.empty((2, 3), dtype=torch.int32)
+    builder._treewy_metadata_prev_path = torch.tensor([[-1, -1, -1], [1, 2, 3]], dtype=torch.int32)
+    builder._treewy_metadata_prev_num_sampled = torch.tensor([1, 4], dtype=torch.int32)
+    outputs = (builder.spec_tree_ancestors, builder.spec_conv_window_rows, builder.spec_conv_prefix_src)
+    addresses = tuple(t.data_ptr() for t in outputs)
+    for step in range(2):
+        if step:
+            builder.spec_tree_parents.copy_(torch.tensor([[0, 1, 2], [0, 0, 0]]))
+            builder.spec_tree_num_nodes.copy_(torch.tensor([0, 3]))
+            builder._treewy_metadata_prev_path.copy_(torch.tensor([[1, 2, -1], [-1, -1, -1]]))
+            builder._treewy_metadata_prev_num_sampled.copy_(torch.tensor([3, 0]))
+        builder._compute_treewy_metadata(2)
+        torch.testing.assert_close(
+            outputs[0], treewy_ancestor_mask(builder.spec_tree_parents, builder.spec_tree_num_nodes)
+        )
+        torch.testing.assert_close(
+            outputs[1], compute_tree_conv_rows(builder.spec_tree_parents, builder.spec_tree_num_nodes, 4, 6)
+        )
+        torch.testing.assert_close(
+            outputs[2], compute_tree_prefix_source(
+                builder._treewy_metadata_prev_path, builder._treewy_metadata_prev_num_sampled, 4
+            )
+        )
+        assert tuple(t.data_ptr() for t in outputs) == addresses
+
+
 def test_tree_conv_rows_follow_the_tree_layout():
     builder = _make_tree_builder()
     builder.spec_conv_width = 4

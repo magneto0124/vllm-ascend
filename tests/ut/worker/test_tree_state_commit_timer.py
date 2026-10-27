@@ -4,10 +4,11 @@
 
 import ast
 import io
+import json
 import runpy
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -87,6 +88,63 @@ class TestTreeStateCommitTimer(unittest.TestCase):
         self.enable(warmup=1)
         self.call_commit()
         self.assertEqual(dict(self.timer["_SAMPLES"]), {})
+        self.sync.assert_not_called()
+
+    def test_capture_never_synchronizes_or_records(self):
+        self.enable()
+        self.timer["torch"].npu.is_current_stream_capturing = Mock(return_value=True)
+        with self.timer["tree_time"]("inside_capture"):
+            self.timer["tree_stat"]("capture_count")
+        self.sync.assert_not_called()
+        self.assertEqual(self.timer["get_tree_timer_report"]()["segments"], {})
+        self.assertEqual(self.timer["get_tree_timer_report"]()["counters"], {})
+
+    def test_profiler_ranges_only_wrap_recorded_work(self):
+        record = Mock(side_effect=lambda name: nullcontext())
+        self.timer["torch"].profiler = SimpleNamespace(record_function=record)
+        with self.timer["tree_time"]("disabled"):
+            pass
+        record.assert_not_called()
+        self.enable()
+        with self.timer["tree_time"]("detail"):
+            pass
+        record.assert_called_once_with("tree_spec::detail")
+
+    def test_rpc_reset_clears_warmup_samples_and_counters(self):
+        self.enable()
+        with self.timer["tree_time"]("measured"):
+            self.timer["tree_stat"]("layers", 3)
+        self.timer["reset_tree_timer"](object())
+        report = self.timer["get_tree_timer_report"](object())
+        self.assertEqual(report["steps"], 0)
+        self.assertEqual(report["segments"], {})
+        self.assertEqual(report["counters"], {})
+        self.sync.reset_mock()
+        with self.timer["tree_time"]("before_next_step"):
+            pass
+        self.sync.assert_not_called()
+
+    def test_snapshot_statistics_are_json_serializable_and_detached(self):
+        self.enable()
+        self.timer["_SAMPLES"]["detail"].extend([1.0, 2.0, 3.0])
+        report = self.timer["get_tree_timer_report"]()
+        stats = report["segments"]["detail"]
+        self.assertEqual(stats["total_ms"], 6.0)
+        self.assertEqual(stats["p50_ms"], 2.0)
+        self.assertAlmostEqual(stats["p90_ms"], 2.8)
+        json.dumps(report)
+        self.timer["reset_tree_timer"]()
+        self.assertEqual(stats["n"], 3)
+
+    def test_nested_spans_and_exception_preserve_execution(self):
+        self.enable()
+        with self.assertRaisesRegex(ValueError, "original error"):
+            with self.timer["tree_time"]("outer"):
+                with self.timer["tree_time"]("inner"):
+                    raise ValueError("original error")
+        report = self.timer["get_tree_timer_report"]()
+        for name in ("outer", "inner"):
+            self.assertEqual(report["segments"][name]["n"], 1)
 
     def test_commit_failure_is_not_swallowed_or_retried(self):
         self.enable()

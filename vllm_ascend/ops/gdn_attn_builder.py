@@ -326,6 +326,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         self._tree_state_table_graphs: dict[int, Any] = {}
         self._tree_state_table_graph_failures: set[int] = set()
+        self._treewy_metadata_graphs: dict[int, Any] = {}
+        self._treewy_metadata_graph_failures: set[int] = set()
+        self._treewy_metadata_prev_path: torch.Tensor | None = None
+        self._treewy_metadata_prev_num_sampled: torch.Tensor | None = None
         self.spec_tree_table_state_pages: torch.Tensor | None = None
         self.spec_tree_table_resume_slots: torch.Tensor | None = None
         self.spec_tree_table_prev_path: torch.Tensor | None = None
@@ -391,6 +395,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     dtype=torch.bool,
                     device=device,
                 )
+                if self.use_full_cuda_graph:
+                    self._treewy_metadata_prev_path = torch.empty(
+                        (sequence_index_capacity, self.spec_tree_slots - 1), dtype=torch.int32, device=device
+                    )
+                    self._treewy_metadata_prev_num_sampled = torch.empty(
+                        (sequence_index_capacity,), dtype=torch.int32, device=device
+                    )
         self.non_spec_sequence_indices: torch.Tensor = torch.empty(
             (sequence_index_capacity,),
             dtype=torch.int64,
@@ -621,6 +632,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         tree_parents: torch.Tensor | None,
         tree_num_nodes: torch.Tensor | None,
         spec_sequence_indices: torch.Tensor,
+        *,
+        compute_ancestors: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Gather tree topology into builder-owned buffers for graph stability."""
         if self.spec_tree_slots is None:
@@ -641,12 +654,85 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         self.spec_tree_parents[:num_rows].copy_(selected_parents[:, : self.spec_tree_slots - 1])
         self.spec_tree_num_nodes[:num_rows].copy_(selected_num_nodes)
-        if self.spec_tree_ancestors is not None:
+        if self.spec_tree_ancestors is not None and compute_ancestors:
             # Topology changes every draft: refresh this stable buffer once per batch, outside graphs.
             self.spec_tree_ancestors[:num_rows].copy_(
                 treewy_ancestor_mask(self.spec_tree_parents[:num_rows], self.spec_tree_num_nodes[:num_rows])
             )
         return self.spec_tree_parents[:num_rows], self.spec_tree_num_nodes[:num_rows]
+
+    def _compute_treewy_metadata(self, rows: int) -> None:
+        """Build TreeWY topology and conv tables without recurrent page selection."""
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            compute_tree_conv_rows,
+            compute_tree_prefix_source,
+        )
+
+        assert self.spec_tree_parents is not None and self.spec_tree_num_nodes is not None
+        assert self.spec_tree_ancestors is not None and self.spec_tree_slots is not None
+        assert self.spec_conv_window_rows is not None and self.spec_conv_prefix_src is not None
+        assert self.spec_conv_width is not None
+        assert self._treewy_metadata_prev_path is not None
+        assert self._treewy_metadata_prev_num_sampled is not None
+        parents = self.spec_tree_parents[:rows]
+        num_nodes = self.spec_tree_num_nodes[:rows]
+        self.spec_tree_ancestors[:rows].copy_(treewy_ancestor_mask(parents, num_nodes))
+        self.spec_conv_window_rows[: rows * self.spec_tree_slots].copy_(
+            compute_tree_conv_rows(parents, num_nodes, self.spec_conv_width, rows * (self.spec_conv_width - 1))
+        )
+        self.spec_conv_prefix_src[:rows].copy_(
+            compute_tree_prefix_source(
+                self._treewy_metadata_prev_path[:rows],
+                self._treewy_metadata_prev_num_sampled[:rows],
+                self.spec_conv_width,
+            )
+        )
+
+    def _run_treewy_metadata_graph(
+        self,
+        rows: int,
+        prev_path: torch.Tensor,
+        prev_num_sampled: torch.Tensor,
+        *,
+        capture: bool,
+    ) -> bool:
+        """Refresh history inputs and replay topology plus conv metadata together."""
+        graph = self._treewy_metadata_graphs.get(rows)
+        if graph is None and (not capture or rows in self._treewy_metadata_graph_failures):
+            return False
+        if (
+            not hasattr(torch, "npu")
+            or not hasattr(torch.npu, "NPUGraph")
+            or not hasattr(torch.npu, "is_current_stream_capturing")
+            or self.spec_tree_parents is None
+            or self.spec_tree_parents.device.type != "npu"
+            or torch.npu.is_current_stream_capturing()
+            or self._treewy_metadata_prev_path is None
+            or self._treewy_metadata_prev_num_sampled is None
+        ):
+            return False
+        self._treewy_metadata_prev_path[:rows].copy_(prev_path[:rows])
+        self._treewy_metadata_prev_num_sampled[:rows].copy_(prev_num_sampled[:rows])
+        if graph is None:
+            try:
+                from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+                from vllm.platforms import current_platform
+
+                validate_cudagraph_capturing_enabled()
+                pool = current_platform.get_global_graph_pool()
+                with torch.inference_mode():
+                    self._compute_treewy_metadata(rows)
+                    graph = torch.npu.NPUGraph()
+                    with torch.npu.graph(graph, pool=pool):
+                        self._compute_treewy_metadata(rows)
+                self._treewy_metadata_graphs[rows] = graph
+                logger.info("Captured GDN TreeWY metadata ACLGraph rows=%s", rows)
+            except Exception as exc:
+                self._treewy_metadata_graph_failures.add(rows)
+                logger.warning("GDN TreeWY metadata ACLGraph capture failed rows=%s; using eager. %s", rows, exc)
+                return False
+        graph.replay()
+        return True
 
     def _build_tree_conv_rows(
         self,
@@ -1231,6 +1317,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         spec_tree_num_nodes: torch.Tensor | None = None
         spec_tree_sequence_indices: torch.Tensor | None = None
         non_spec_conv1d_cache_indices: torch.Tensor | None = None
+        treewy_metadata_graph_batch = False
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -1270,12 +1357,24 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     num_spec_decodes,
                 )
                 if self.spec_tree_slots is not None:
+                    treewy_metadata_graph_batch = (
+                        self.use_full_cuda_graph
+                        and selected_gdn_state_update_name() == "treewy"
+                        and self.spec_conv_width is not None
+                        and num_spec_decodes == m.num_reqs
+                        and m.num_reqs * self.spec_tree_slots <= self.decode_cudagraph_max_bs
+                        and bool(torch.all(torch.diff(query_start_loc_cpu) == self.spec_tree_slots))
+                        and prev_path_node_ids is not None
+                        and prev_num_sampled is not None
+                        and (_capture_tree_state_table_graph or num_spec_decodes in self._treewy_metadata_graphs)
+                    )
                     spec_tree_parents, spec_tree_num_nodes = _tree_profiled_call(
                         "gdn_tree_layout_select",
                         self._select_tree_layout,
                         tree_parents,
                         tree_num_nodes,
                         spec_sequence_indices,
+                        compute_ancestors=not treewy_metadata_graph_batch,
                     )
                     spec_tree_sequence_indices = spec_sequence_indices
 
@@ -1425,6 +1524,26 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 and bool(torch.all(spec_row_widths == self.spec_tree_slots))
             )
             state_table_graph_outputs = None
+            if treewy_metadata_graph_batch:
+                treewy_graph_ran = _tree_profiled_call(
+                    "gdn_treewy_metadata_graph",
+                    self._run_treewy_metadata_graph,
+                    num_spec_decodes,
+                    prev_path_node_ids,
+                    prev_num_sampled,
+                    capture=_capture_tree_state_table_graph,
+                )
+                if treewy_graph_ran:
+                    state_table_graph_outputs = (
+                        None,
+                        self.spec_conv_window_rows[: num_spec_decodes * self.spec_tree_slots],
+                        self.spec_conv_prefix_src[:num_spec_decodes],
+                    )
+                else:
+                    # Layout selection deferred this write until the combined graph.
+                    self.spec_tree_ancestors[:num_spec_decodes].copy_(
+                        treewy_ancestor_mask(spec_tree_parents, spec_tree_num_nodes)
+                    )
             if (
                 full_width_snapshot_batch
                 and (_capture_tree_state_table_graph or num_spec_decodes in self._tree_state_table_graphs)
@@ -1475,7 +1594,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 )
             if spec_conv_window_rows is not None and self.spec_conv_window_rows is not None:
                 # Pack state pages the same way (recurrent op reads by token offset; conv reads per row).
-                if not full_width_snapshot_batch:
+                if not full_width_snapshot_batch and not treewy_metadata_graph_batch:
                     spec_state_indices_tensor = _tree_profiled_call(
                         "gdn_state_page_pack",
                         _pack_tree_rows_to_tokens,
@@ -1712,10 +1831,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> GDNAttentionMetadata:
-        """Prepare tree-aware metadata and capture fixed-width read tables during warmup.
+        """Prepare tree-aware metadata and capture fixed-width metadata during warmup.
 
-        A full graph replays the recorded kernels, so the recurrent op has to be captured
-        with its ``init_state_indices`` input; replays rebuild the captured values.
+        Snapshot captures recurrent/conv read tables; TreeWY captures ancestors
+        and conv tables, with no per-node recurrent page indices.
         """
         if self.spec_tree_slots is None:
             return super().build_for_cudagraph_capture(common_attn_metadata)

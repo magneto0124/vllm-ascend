@@ -1,7 +1,7 @@
 import atexit
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 import torch
@@ -65,6 +65,64 @@ def tree_timer_enabled() -> bool:
     return _ENABLED
 
 
+def _can_time() -> bool:
+    # A Python timer cannot run on replay; fences during capture are illegal.
+    if not _ENABLED or not _RECORDING:
+        return False
+    npu = getattr(torch, "npu", None)
+    capturing = getattr(npu, "is_current_stream_capturing", None)
+    return not (capturing is not None and capturing())
+
+
+def reset_tree_timer(worker=None) -> None:
+    """Reset observations after warmup; also usable via LLM.collective_rpc."""
+    global _STEP, _RECORDING
+    _STEP = 0
+    _RECORDING = False
+    _SAMPLES.clear()
+    _ACCUM.clear()
+    _STAT_COUNT.clear()
+    _STAT_SUM.clear()
+
+
+def get_tree_timer_report(worker=None) -> dict:
+    """Return rank-local JSON data without a device transfer or synchronization."""
+    segments = {}
+    for name, values in _SAMPLES.items():
+        if not values:
+            continue
+        ordered = sorted(values)
+
+        def percentile(p: float) -> float:
+            position = (len(ordered) - 1) * p
+            lower = int(position)
+            upper = min(lower + 1, len(ordered) - 1)
+            return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+        total = sum(values)
+        segments[name] = {
+            "n": len(values),
+            "total_ms": total,
+            "mean_ms": total / len(values),
+            "min_ms": ordered[0],
+            "max_ms": ordered[-1],
+            "p50_ms": percentile(0.5),
+            "p90_ms": percentile(0.9),
+            "p99_ms": percentile(0.99),
+        }
+    return {
+        "backend": _BACKEND,
+        "steps": _STEP,
+        "warmup_steps": _WARMUP_STEPS,
+        "meta": dict(_META),
+        "segments": segments,
+        "counters": {
+            name: {"n": n, "sum": _STAT_SUM[name], "mean": _STAT_SUM[name] / n}
+            for name, n in _STAT_COUNT.items()
+        },
+    }
+
+
 def tree_timer_begin_step() -> None:
     """Mark the start of one decode step (verify + propose)."""
     global _STEP, _RECORDING
@@ -77,7 +135,7 @@ def tree_timer_begin_step() -> None:
 
 def tree_stat(name: str, value: float = 1.0) -> None:
     """Count one shape observation for the exit report; callers must keep device syncs gated."""
-    if not _ENABLED:
+    if not _can_time():
         return
     _STAT_COUNT[name] += 1
     _STAT_SUM[name] += float(value)
@@ -97,13 +155,16 @@ def _sync() -> None:
 @contextmanager
 def tree_time(segment: str) -> Iterator[None]:
     """Time one segment with device synchronize; no-op when disabled."""
-    if not tree_timer_enabled():
+    if not _can_time():
         yield
         return
     _sync()
     t0 = time.perf_counter()
     try:
-        yield
+        profiler = getattr(torch, "profiler", None)
+        span = profiler.record_function("tree_spec::" + segment) if profiler is not None else nullcontext()
+        with span:
+            yield
     finally:
         _sync()
         if _RECORDING:
@@ -113,13 +174,16 @@ def tree_time(segment: str) -> Iterator[None]:
 @contextmanager
 def tree_time_accum(segment: str) -> Iterator[None]:
     """Accumulate timed spans into one per-step sample (for expand depth loops)."""
-    if not tree_timer_enabled():
+    if not _can_time():
         yield
         return
     _sync()
     t0 = time.perf_counter()
     try:
-        yield
+        profiler = getattr(torch, "profiler", None)
+        span = profiler.record_function("tree_spec::" + segment) if profiler is not None else nullcontext()
+        with span:
+            yield
     finally:
         _sync()
         if _RECORDING:
@@ -143,11 +207,14 @@ def print_tree_timer_report() -> None:
     lines = [
         "========== tree-spec timer report ==========",
         f"backend={_BACKEND} sync=device steps={_STEP} warmup={_WARMUP_STEPS}",
+        "Nested spans are inclusive; do not sum parents and children. Per-layer spans count layer calls.",
+        "Synchronized diagnostic timings perturb overlap; benchmark throughput with enable_timer=False.",
     ]
     if _META:
         meta_str = " ".join(f"{k}={v}" for k, v in sorted(_META.items()))
         lines.append(f"config: {meta_str}")
     any_data = False
+    report = get_tree_timer_report()
     extra_segments = sorted(set(_SAMPLES) - set(TREE_TIMER_SEGMENTS))
     for name in (*TREE_TIMER_SEGMENTS, *extra_segments):
         vals = list(_SAMPLES.get(name, []))
@@ -159,7 +226,8 @@ def print_tree_timer_report() -> None:
         mean = sum(vals) / n
         lines.append(
             f"  {name}: n={n} mean_ms={mean:.3f} "
-            f"min_ms={min(vals):.3f} max_ms={max(vals):.3f}"
+            f"min_ms={min(vals):.3f} max_ms={max(vals):.3f} "
+            f"total_ms={sum(vals):.3f} p90_ms={report['segments'][name]['p90_ms']:.3f}"
         )
     if not any_data:
         lines.append("  (no samples after warmup)")

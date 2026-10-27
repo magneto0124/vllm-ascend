@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.builder import (
 )
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, ensure_finalize_scratch
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_stat, tree_time
 from vllm_ascend.worker.v2.utils import communicator_switch, torch_cuda_wrapper
 
 logger = logging.getLogger(__name__)
@@ -514,8 +516,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         All inputs are views refreshed before replay; intermediates stay in the graph pool.
         """
         num_sample = num_reqs * self.num_speculative_steps
-        hidden = self._draft_hidden_buf[self.sample_indices[:num_sample]]
-        logits = self.model.compute_draft_logits(hidden)
+        with nullcontext() if graph_safe else tree_time("beam_gather_hidden"):
+            hidden = self._draft_hidden_buf[self.sample_indices[:num_sample]]
+        with nullcontext() if graph_safe else tree_time("beam_compute_logits"):
+            logits = self.model.compute_draft_logits(hidden)
         nqp = self.num_query_per_req
         roots = self.input_buffers.input_ids[: num_reqs * nqp].view(num_reqs, nqp)[:, 0]
         proposal = None
@@ -535,9 +539,22 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             return
         manager = self.query_cudagraph_manager
         if manager is None or not manager.needs_capture():
+            logger.warning(
+                "Beam tree capture skipped: no draft capture descriptors; "
+                "num_query_per_req=%s max_num_reqs=%s. Check draft enforce_eager "
+                "and cudagraph_capture_sizes against the actual draft query length.",
+                self.num_query_per_req,
+                self.max_num_reqs,
+            )
             return
         sizes = self._draft_capture_num_reqs()
         sizes = sorted({size for size in sizes if 0 < size <= self.max_num_reqs})
+        logger.info(
+            "Beam tree capture plan: num_query_per_req=%s max_num_reqs=%s request_gears=%s",
+            self.num_query_per_req,
+            self.max_num_reqs,
+            sizes,
+        )
         if not sizes or not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
             return
         from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
@@ -615,23 +632,27 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
             )
-        self._draft_hidden_buf[:num_tokens_padded].copy_(hidden)
+        with tree_time("draft_hidden_copy"):
+            self._draft_hidden_buf[:num_tokens_padded].copy_(hidden)
         self._tree_finalized = False
 
     def _finalize_tree(self, num_reqs: int) -> None:
         if self.tree_builder is None or self._tree_finalized:
             return
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
-
         if self.method == "beam":
             graph = self._beam_graphs.get(num_reqs)
             with tree_time("build_draft_tree"):
                 if graph is None:
-                    self._run_beam_finalize(num_reqs, graph_safe=False)
+                    tree_stat(f"beam_eager_reqs_{num_reqs}")
+                    with tree_time("beam_eager_finalize"):
+                        self._run_beam_finalize(num_reqs, graph_safe=False)
                 else:
-                    graph.replay()
+                    tree_stat(f"beam_graph_replay_reqs_{num_reqs}")
+                    with tree_time("beam_graph_replay"):
+                        graph.replay()
             if graph is not None:
-                self.tree = self._load_layout_from_buffers(num_reqs)
+                with tree_time("beam_bind_layout"):
+                    self.tree = self._load_layout_from_buffers(num_reqs)
             self._tree_finalized = True
             return
 

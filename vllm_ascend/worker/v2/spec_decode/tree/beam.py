@@ -1,7 +1,10 @@
+from contextlib import nullcontext
+
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.tree.builder import TreeBuilder
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout
+from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
 
 def _markov_correct_logits(
@@ -117,6 +120,7 @@ class BeamTreeBuilder(TreeBuilder):
         proposal_logits: torch.Tensor | None = None,
         graph_safe: bool = False,
     ) -> TreeLayout:
+        tick = (lambda _segment: nullcontext()) if graph_safe else tree_time
         budget = self.budget
         topk = self.topk
         draft_model = self.draft_model
@@ -124,13 +128,14 @@ class BeamTreeBuilder(TreeBuilder):
         k = min(topk, vocab)
         device = draft_logits.device
         need_proposal = proposal_logits is not None
-        self._ensure_scratch(
-            num_reqs,
-            vocab,
-            spec_num,
-            device,
-            need_proposal=need_proposal,
-        )
+        with tick("beam_scratch"):
+            self._ensure_scratch(
+                num_reqs,
+                vocab,
+                spec_num,
+                device,
+                need_proposal=need_proposal,
+            )
         if self._pool_tokens is None:
             raise RuntimeError("beam scratch buffers were not initialized")
         pool_capacity = self._pool_tokens.shape[1]
@@ -143,118 +148,128 @@ class BeamTreeBuilder(TreeBuilder):
         if need_proposal and self._prop_temp is None:
             raise RuntimeError("beam proposal scratch was not initialized before graph replay")
 
-        frontier_tokens = self._frontier_tokens[:num_reqs]
-        frontier_scores = self._frontier_scores[:num_reqs]
-        frontier_pools = self._frontier_pools[:num_reqs]
-        next_frontier_tokens = self._next_frontier_tokens[:num_reqs]
-        next_frontier_scores = self._next_frontier_scores[:num_reqs]
-        next_frontier_pools = self._next_frontier_pools[:num_reqs]
-        frontier_tokens[:, 0] = root_token_ids
-        frontier_scores.zero_()
-        frontier_pools.fill_(-1)
+        with tick("beam_prepare_buffers"):
+            frontier_tokens = self._frontier_tokens[:num_reqs]
+            frontier_scores = self._frontier_scores[:num_reqs]
+            frontier_pools = self._frontier_pools[:num_reqs]
+            next_frontier_tokens = self._next_frontier_tokens[:num_reqs]
+            next_frontier_scores = self._next_frontier_scores[:num_reqs]
+            next_frontier_pools = self._next_frontier_pools[:num_reqs]
+            frontier_tokens[:, 0] = root_token_ids
+            frontier_scores.zero_()
+            frontier_pools.fill_(-1)
 
-        pool_tokens = self._pool_tokens[:num_reqs]
-        pool_scores = self._pool_scores[:num_reqs]
-        pool_parents = self._pool_parents[:num_reqs]
-        pool_depth = self._pool_depth[:num_reqs]
+            pool_tokens = self._pool_tokens[:num_reqs]
+            pool_scores = self._pool_scores[:num_reqs]
+            pool_parents = self._pool_parents[:num_reqs]
+            pool_depth = self._pool_depth[:num_reqs]
 
-        # Temp proposal indexed by root=0 and pool slot i -> i+1. Remapped later.
-        # FP32 to match tree_proposal_logits; NPU IndexPut rejects BF16.
-        prop_temp = None
-        if need_proposal:
-            prop_temp = self._prop_temp[:num_reqs, : pool_capacity + 1, :vocab]
-            prop_temp.fill_(float("-inf"))
+            # Temp proposal indexed by root=0 and pool slot i -> i+1. Remapped later.
+            # FP32 to match tree_proposal_logits; NPU IndexPut rejects BF16.
+            prop_temp = None
+            if need_proposal:
+                prop_temp = self._prop_temp[:num_reqs, : pool_capacity + 1, :vocab]
+                prop_temp.fill_(float("-inf"))
 
         pool_offset = 0
         for depth in range(spec_num):
             batch = 1 if depth == 0 else k
             frontier = frontier_tokens[:, :batch]
-            step_logits = _markov_correct_logits(
-                draft_model, draft_logits[:, depth], frontier
-            )
+            with tick("beam_markov_logits"):
+                step_logits = _markov_correct_logits(
+                    draft_model, draft_logits[:, depth], frontier
+                )
             if prop_temp is not None:
-                req_idx = torch.arange(num_reqs, device=device)
-                step_f = step_logits.to(dtype=prop_temp.dtype)
-                for j in range(batch):
-                    parent_pool = frontier_pools[:, j]
-                    temp_id = torch.where(
-                        parent_pool < 0,
-                        torch.zeros((), dtype=torch.long, device=device),
-                        parent_pool + 1,
-                    ).clamp(max=prop_temp.shape[1] - 1)
-                    prop_temp[req_idx, temp_id] = step_f[:, j]
-            log_probs = torch.log_softmax(step_logits.float(), dim=-1)
-            top_vals, top_ids = log_probs.topk(k, dim=-1)
-            if draft_model is not None:
-                top_ids = draft_model.map_draft_to_target(top_ids)
-            candidate_scores = frontier_scores[:, :batch].unsqueeze(-1) + top_vals
-            num_candidates = batch * k
-            pool_end = pool_offset + num_candidates
-            pool_tokens[:, pool_offset:pool_end] = top_ids.reshape(num_reqs, -1)
-            pool_scores[:, pool_offset:pool_end] = candidate_scores.reshape(num_reqs, -1)
-            pool_parents[:, pool_offset:pool_end] = frontier_pools[:, :batch].repeat_interleave(
-                k, dim=-1
+                with tick("beam_proposal_store"):
+                    req_idx = torch.arange(num_reqs, device=device)
+                    step_f = step_logits.to(dtype=prop_temp.dtype)
+                    for j in range(batch):
+                        parent_pool = frontier_pools[:, j]
+                        temp_id = torch.where(
+                            parent_pool < 0,
+                            torch.zeros((), dtype=torch.long, device=device),
+                            parent_pool + 1,
+                        ).clamp(max=prop_temp.shape[1] - 1)
+                        prop_temp[req_idx, temp_id] = step_f[:, j]
+            with tick("beam_softmax_topk"):
+                log_probs = torch.log_softmax(step_logits.float(), dim=-1)
+                top_vals, top_ids = log_probs.topk(k, dim=-1)
+                if draft_model is not None:
+                    top_ids = draft_model.map_draft_to_target(top_ids)
+            with tick("beam_pool_write"):
+                candidate_scores = frontier_scores[:, :batch].unsqueeze(-1) + top_vals
+                num_candidates = batch * k
+                pool_end = pool_offset + num_candidates
+                pool_tokens[:, pool_offset:pool_end] = top_ids.reshape(num_reqs, -1)
+                pool_scores[:, pool_offset:pool_end] = candidate_scores.reshape(num_reqs, -1)
+                pool_parents[:, pool_offset:pool_end] = frontier_pools[:, :batch].repeat_interleave(
+                    k, dim=-1
+                )
+                pool_depth[:, pool_offset:pool_end].fill_(depth)
+
+            with tick("beam_frontier_select"):
+                keep = k
+                cand_flat = candidate_scores.reshape(num_reqs, -1)
+                top_ids_flat = top_ids.reshape(num_reqs, -1)
+                selected = cand_flat.topk(keep, dim=-1).indices
+                next_frontier_tokens[:, :keep] = torch.gather(top_ids_flat, 1, selected)
+                next_frontier_scores[:, :keep] = torch.gather(cand_flat, 1, selected)
+                next_frontier_pools[:, :keep] = pool_offset + selected
+                frontier_tokens, next_frontier_tokens = next_frontier_tokens, frontier_tokens
+                frontier_scores, next_frontier_scores = next_frontier_scores, frontier_scores
+                frontier_pools, next_frontier_pools = next_frontier_pools, frontier_pools
+                pool_offset = pool_end
+
+        with tick("beam_prune_sort"):
+            num_pool = pool_offset
+            num_nodes = min(int(budget), num_pool)
+            pool_tokens = pool_tokens[:, :num_pool]
+            pool_scores = pool_scores[:, :num_pool]
+            pool_parents = pool_parents[:, :num_pool]
+            pool_depth = pool_depth[:, :num_pool]
+            order = torch.argsort(pool_depth, dim=-1, stable=True)
+            order = torch.gather(
+                order,
+                1,
+                torch.argsort(
+                    torch.gather(pool_scores, 1, order),
+                    dim=-1,
+                    descending=True,
+                    stable=True,
+                ),
             )
-            pool_depth[:, pool_offset:pool_end].fill_(depth)
+            packed = order[:, :num_nodes].sort(dim=-1).values
 
-            keep = k
-            cand_flat = candidate_scores.reshape(num_reqs, -1)
-            top_ids_flat = top_ids.reshape(num_reqs, -1)
-            selected = cand_flat.topk(keep, dim=-1).indices
-            next_frontier_tokens[:, :keep] = torch.gather(top_ids_flat, 1, selected)
-            next_frontier_scores[:, :keep] = torch.gather(cand_flat, 1, selected)
-            next_frontier_pools[:, :keep] = pool_offset + selected
-            frontier_tokens, next_frontier_tokens = next_frontier_tokens, frontier_tokens
-            frontier_scores, next_frontier_scores = next_frontier_scores, frontier_scores
-            frontier_pools, next_frontier_pools = next_frontier_pools, frontier_pools
-            pool_offset = pool_end
+        with tick("beam_remap"):
+            remap = self._remap[:num_reqs, :num_pool]
+            remap.zero_()
+            node_ids = torch.arange(
+                1, num_nodes + 1, dtype=torch.long, device=device
+            ).unsqueeze(0)
+            remap.scatter_(1, packed, node_ids.expand(num_reqs, num_nodes))
+            pool_parent_packed = torch.gather(pool_parents, 1, packed)
+            non_root = pool_parent_packed >= 0
+            raw_parent = torch.gather(remap, 1, pool_parent_packed.clamp(min=0))
+            parent_ids = torch.where(
+                non_root, raw_parent, torch.zeros_like(raw_parent)
+            )
 
-        num_pool = pool_offset
-        num_nodes = min(int(budget), num_pool)
-        pool_tokens = pool_tokens[:, :num_pool]
-        pool_scores = pool_scores[:, :num_pool]
-        pool_parents = pool_parents[:, :num_pool]
-        pool_depth = pool_depth[:, :num_pool]
-        order = torch.argsort(pool_depth, dim=-1, stable=True)
-        order = torch.gather(
-            order,
-            1,
-            torch.argsort(
-                torch.gather(pool_scores, 1, order),
-                dim=-1,
-                descending=True,
-                stable=True,
-            ),
-        )
-        packed = order[:, :num_nodes].sort(dim=-1).values
-
-        remap = self._remap[:num_reqs, :num_pool]
-        remap.zero_()
-        node_ids = torch.arange(
-            1, num_nodes + 1, dtype=torch.long, device=device
-        ).unsqueeze(0)
-        remap.scatter_(1, packed, node_ids.expand(num_reqs, num_nodes))
-        pool_parent_packed = torch.gather(pool_parents, 1, packed)
-        non_root = pool_parent_packed >= 0
-        raw_parent = torch.gather(remap, 1, pool_parent_packed.clamp(min=0))
-        parent_ids = torch.where(
-            non_root, raw_parent, torch.zeros_like(raw_parent)
-        )
-
-        tokens = torch.gather(pool_tokens, 1, packed)
-        depths = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
-        finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes, force_torch=graph_safe)
+            tokens = torch.gather(pool_tokens, 1, packed)
+            depths = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
+        with tick("beam_finalize_layout"):
+            finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes, force_torch=graph_safe)
 
         if proposal_logits is not None and prop_temp is not None:
-            proposal_logits.fill_(float("-inf"))
-            proposal_logits[:, 0] = prop_temp[:, 0]
-            req_idx = torch.arange(num_reqs, device=device)
-            for pool_idx in range(num_pool):
-                final_id = remap[:, pool_idx]
-                has = final_id > 0
-                proposal_logits[req_idx, final_id.clamp(min=0)] = torch.where(
-                    has.unsqueeze(-1),
-                    prop_temp[:, pool_idx + 1],
-                    proposal_logits[req_idx, final_id.clamp(min=0)],
-                )
+            with tick("beam_proposal_remap"):
+                proposal_logits.fill_(float("-inf"))
+                proposal_logits[:, 0] = prop_temp[:, 0]
+                req_idx = torch.arange(num_reqs, device=device)
+                for pool_idx in range(num_pool):
+                    final_id = remap[:, pool_idx]
+                    has = final_id > 0
+                    proposal_logits[req_idx, final_id.clamp(min=0)] = torch.where(
+                        has.unsqueeze(-1),
+                        prop_temp[:, pool_idx + 1],
+                        proposal_logits[req_idx, final_id.clamp(min=0)],
+                    )
         return out

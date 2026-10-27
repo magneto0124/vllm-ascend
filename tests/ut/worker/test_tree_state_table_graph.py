@@ -21,7 +21,8 @@ def load_graph_methods(torch):
     cls = next(node for node in module.body if isinstance(node, ast.ClassDef)
                and node.name == "AscendGDNAttentionMetadataBuilder")
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in {
-        "_get_or_capture_snapshot_tree_state_table_graph", "_run_snapshot_tree_state_table_graph"
+        "_get_or_capture_snapshot_tree_state_table_graph", "_run_snapshot_tree_state_table_graph",
+        "_run_treewy_metadata_graph",
     }]
     isolated = ast.Module(body=[ast.ClassDef(
         name="Builder", bases=[], keywords=[], body=methods, decorator_list=[]
@@ -60,6 +61,84 @@ class TestTreeStateTableGraph(unittest.TestCase):
         self.builder._copy_tree_state_table_inputs = Mock()
         self.indices = Mock()
         self.indices.numel.return_value = 2
+
+    def run_treewy(self, capture=False):
+        return self.builder._run_treewy_metadata_graph(2, MagicMock(), MagicMock(), capture=capture)
+
+    def prepare_treewy(self):
+        self.builder._treewy_metadata_graphs = {}
+        self.builder._treewy_metadata_graph_failures = set()
+        self.builder._treewy_metadata_prev_path = MagicMock()
+        self.builder._treewy_metadata_prev_num_sampled = MagicMock()
+        self.builder._compute_treewy_metadata = Mock()
+
+    def test_treewy_capture_and_replay_refresh_history(self):
+        self.prepare_treewy()
+        self.assertTrue(self.run_treewy(capture=True))
+        graph = self.builder._treewy_metadata_graphs[2]
+        self.assertEqual(self.builder._compute_treewy_metadata.call_count, 2)
+        self.assertTrue(self.run_treewy())
+        self.assertEqual(graph.replay.call_count, 2)
+        self.assertEqual(self.builder._treewy_metadata_prev_path.__getitem__.return_value.copy_.call_count, 2)
+        self.assertEqual(self.builder._treewy_metadata_prev_num_sampled.__getitem__.return_value.copy_.call_count, 2)
+        self.torch.npu.NPUGraph.assert_called_once()
+
+    def test_treewy_uncaptured_size_and_nested_capture_fall_back(self):
+        self.prepare_treewy()
+        self.assertFalse(self.run_treewy())
+        self.torch.npu.is_current_stream_capturing.return_value = True
+        self.assertFalse(self.run_treewy(capture=True))
+        self.builder._treewy_metadata_prev_path.__getitem__.assert_not_called()
+        self.torch.npu.NPUGraph.assert_not_called()
+
+    def test_treewy_failed_capture_is_not_retried(self):
+        self.prepare_treewy()
+        self.torch.npu.graph.side_effect = RuntimeError("unsupported capture")
+        self.assertFalse(self.run_treewy(capture=True))
+        self.assertFalse(self.run_treewy(capture=True))
+        self.assertIn(2, self.builder._treewy_metadata_graph_failures)
+        self.torch.npu.NPUGraph.assert_called_once()
+
+    def test_treewy_replay_failure_propagates(self):
+        self.prepare_treewy()
+        graph = Mock()
+        graph.replay.side_effect = RuntimeError("replay failed")
+        self.builder._treewy_metadata_graphs[2] = graph
+        with self.assertRaisesRegex(RuntimeError, "replay failed"):
+            self.run_treewy()
+
+    def test_treewy_gate_excludes_short_mixed_padded_and_uncaptured_batches(self):
+        module = ast.parse(BUILDER_PATH.read_text(encoding="utf-8"))
+        gate = next(node for node in ast.walk(module) if isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.BoolOp)
+                    and any(isinstance(target, ast.Name) and target.id == "treewy_metadata_graph_batch"
+                            for target in node.targets))
+        expr = compile(ast.Expression(gate.value), str(BUILDER_PATH), "eval")
+        self.prepare_treewy()
+        self.builder.use_full_cuda_graph = True
+        self.builder.decode_cudagraph_max_bs = 128
+        self.torch.all.return_value = True
+        values = dict(self=self.builder, torch=self.torch, num_spec_decodes=2,
+                      m=SimpleNamespace(num_reqs=2), query_start_loc_cpu=Mock(),
+                      prev_path_node_ids=Mock(), prev_num_sampled=Mock(),
+                      _capture_tree_state_table_graph=True,
+                      selected_gdn_state_update_name=lambda: "treewy")
+        self.assertTrue(eval(expr, values))
+        for changes in (
+            {"num_spec_decodes": 1}, {"m": SimpleNamespace(num_reqs=9), "num_spec_decodes": 9},
+            {"selected_gdn_state_update_name": lambda: "snapshot"},
+            {"prev_path_node_ids": None}, {"prev_num_sampled": None},
+            {"_capture_tree_state_table_graph": False},
+        ):
+            with self.subTest(changes=changes):
+                self.assertFalse(eval(expr, {**values, **changes}))
+        self.torch.all.return_value = False
+        self.assertFalse(eval(expr, values))
+        self.torch.all.return_value = True
+        self.builder._treewy_metadata_graphs[2] = Mock()
+        self.assertTrue(eval(expr, {**values, "_capture_tree_state_table_graph": False}))
+        self.builder.use_full_cuda_graph = False
+        self.assertFalse(eval(expr, values))
 
     def run_tables(self, capture=False):
         return self.builder._run_snapshot_tree_state_table_graph(

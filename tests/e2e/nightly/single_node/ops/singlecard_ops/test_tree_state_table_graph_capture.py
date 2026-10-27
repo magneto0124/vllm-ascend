@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NPU correctness and timing checks for snapshot state-table ACLGraphs."""
+"""NPU correctness and timing checks for tree metadata ACLGraphs."""
 
 import time
 
@@ -13,6 +13,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     compute_tree_init_state_indices,
     compute_tree_prefix_source,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.treewy import treewy_ancestor_mask
 
 
 def _table_builder(rows: int, slots: int, width: int):
@@ -46,6 +47,53 @@ def _mean_ms(fn, repeats=30):
         fn()
     torch.npu.synchronize()
     return (time.perf_counter() - start) * 1000 / repeats
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8])
+@torch.inference_mode()
+def test_treewy_metadata_graph_updated_inputs(rows):
+    slots, width = 16, 4
+    builder = _table_builder(rows, slots, width)
+    builder._treewy_metadata_graphs = {}
+    builder._treewy_metadata_graph_failures = set()
+    builder.spec_tree_ancestors = torch.empty((rows, slots, slots), device="npu", dtype=torch.bool)
+    builder._treewy_metadata_prev_path = torch.empty((rows, slots - 1), device="npu", dtype=torch.int32)
+    builder._treewy_metadata_prev_num_sampled = torch.empty((rows,), device="npu", dtype=torch.int32)
+    paths = torch.arange(1, slots, device="npu", dtype=torch.int32).expand(rows, -1).contiguous()
+    sampled = torch.ones(rows, device="npu", dtype=torch.int32)
+    assert builder._run_treewy_metadata_graph(rows, paths, sampled, capture=True)
+    outputs = (builder.spec_tree_ancestors, builder.spec_conv_window_rows, builder.spec_conv_prefix_src)
+    pointers = tuple(output.data_ptr() for output in outputs)
+    for step in range(4):
+        parents = torch.arange(slots - 1, dtype=torch.int32, device="npu") // (step + 1)
+        builder.spec_tree_parents.copy_(parents.expand(rows, -1))
+        builder.spec_tree_num_nodes.fill_(slots - 1 if step % 2 else 0)
+        # Fresh sampler tensors must be copied into the captured addresses.
+        paths = paths.flip(1).contiguous()
+        sampled = torch.full_like(sampled, step)
+        reference = (
+            treewy_ancestor_mask(builder.spec_tree_parents, builder.spec_tree_num_nodes),
+            compute_tree_conv_rows(builder.spec_tree_parents, builder.spec_tree_num_nodes, width, rows * (width - 1)),
+            compute_tree_prefix_source(paths, sampled, width),
+        )
+        for output in outputs:
+            output.zero_()
+        assert builder._run_treewy_metadata_graph(rows, paths, sampled, capture=False)
+        assert tuple(output.data_ptr() for output in outputs) == pointers
+        for actual, expected in zip(outputs, reference):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def eager():
+        builder._treewy_metadata_prev_path.copy_(paths)
+        builder._treewy_metadata_prev_num_sampled.copy_(sampled)
+        builder._compute_treewy_metadata(rows)
+
+    def replay():
+        builder._run_treewy_metadata_graph(rows, paths, sampled, capture=False)
+
+    eager_ms = _mean_ms(eager)
+    graph_ms = _mean_ms(replay)
+    print(f"[GDN-TREEWY-META] rows={rows} exact=True eager_ms={eager_ms:.3f} graph_ms={graph_ms:.3f}", flush=True)
 
 
 @pytest.mark.parametrize("rows", [1, 2, 8])
