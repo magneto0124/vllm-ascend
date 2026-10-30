@@ -16,6 +16,10 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
 from vllm_ascend.worker.v2.spec_decode.tree.builder import (
     create_tree_builder,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.dflash2_selector import (
+    DFlash2TreeSelector,
+    is_dflash2_architecture,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, ensure_finalize_scratch
 from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_stat, tree_time
@@ -34,7 +38,7 @@ def _hf_dflash_config(hf_config) -> dict:
 
 
 class AscendTreeSpeculator(AscendDFlashSpeculator):
-    """Parallel-draft tree host (DFlash or DSpark draft) + topology builder.
+    """Parallel-draft tree host (DFlash, DFlash2 or DSpark draft) + topology builder.
 
     Draft model forward is one parallel pass. Tree construction replaces
     per-position single-token sampling via ``self.tree_builder``.
@@ -43,6 +47,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     (bonus + N-1 masks) and sample the bonus hidden as draft slot 0.
     Vanilla DFlash / priority / beam keep the 1+N mask-only layout (beam uses
     DSpark's own query layout).
+
+    DFlash2 has no draft LM head, so its depth rows are scored by the candidate
+    selector (:mod:`tree.dflash2_selector`) instead of ``compute_logits``.
 
     ``propose()`` still returns flattened non-root tokens so the existing
     runner call stays valid. The tree itself is ``self.tree`` after
@@ -82,6 +89,32 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.draft_backend = (
             "dspark" if self.speculative_config.use_dspark() else "dflash"
         )
+        # DFlash2 has no draft LM head of its own, so its rows come from the
+        # candidate selector instead of compute_logits / compute_draft_logits.
+        self.dflash2_selector: DFlash2TreeSelector | None = None
+        if is_dflash2_architecture(self.speculative_config.draft_model_config):
+            if self.speculative_config.draft_sample_method != "greedy":
+                raise NotImplementedError(
+                    "DFlash2 draft tree scoring produces rows from the candidate "
+                    "selector and is greedy-only; set "
+                    "speculative_config.draft_sample_method='greedy'."
+                )
+            self.dflash2_selector = DFlash2TreeSelector(
+                self.speculative_config.draft_model_config,
+                self.num_speculative_steps,
+                self.vocab_size,
+            )
+            if self.topk is not None and self.topk > self.dflash2_selector.top_k:
+                logger.warning(
+                    "tree_spec_config.topk=%s exceeds the DFlash2 selector_top_k=%s; "
+                    "the selector only ranks that many children per depth.",
+                    self.topk,
+                    self.dflash2_selector.top_k,
+                )
+            logger.info(
+                "DFlash2 tree scoring enabled: selector_top_k=%s",
+                self.dflash2_selector.top_k,
+            )
 
         self.tree_builder = None
         self._domino_scorer = None
@@ -169,7 +202,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         logger.info(
             "Tree speculator enabled: method=%s budget=%s topk=%s "
             "depth=%s sample_from_anchor=%s num_query_per_req=%s "
-            "draft_backend=%s domino_shift_label=%s magicmtp=%s",
+            "draft_backend=%s domino_shift_label=%s magicmtp=%s dflash2_selector=%s",
             self.method,
             self.budget,
             self.topk,
@@ -179,6 +212,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self.draft_backend,
             self._domino_shift_label,
             self.tree_proposal_logits is not None,
+            self.dflash2_selector is not None,
         )
         from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
         from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
@@ -222,6 +256,22 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         super().load_model(target_model)
         self._bind_correction_heads(target_model)
 
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.dflash2_selector is not None:
+            # The selector top-k's the full vocabulary and all-gathers across TP,
+            # which the linear DFlash2 speculator also refuses to capture. Accept
+            # either enforce_eager knob; raise only when neither asked for eager.
+            model_eager = bool(
+                getattr(self.vllm_config.model_config, "enforce_eager", False)
+            )
+            if not self.speculative_config.enforce_eager and not model_eager:
+                raise NotImplementedError(
+                    "dflash2 draft tree scoring does not support graph mode yet; "
+                    "enable enforce_eager in speculative_config (or on the model)."
+                )
+            cudagraph_mode = CUDAGraphMode.NONE
+        super().init_cudagraph_manager(cudagraph_mode)
+
     def _bind_correction_heads(self, target_model: nn.Module) -> None:
         """Resolve Domino heads (prefix) then construct the tree builder."""
         from vllm_ascend.worker.v2.spec_decode.tree.prefix import (
@@ -230,7 +280,13 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
 
         model = self.model
         draft_model = None
-        if self.method == "beam":
+        if (
+            self.method == "beam"
+            and hasattr(model, "markov_embed")
+            and hasattr(model, "markov_bias")
+        ):
+            # Only DSpark carries the Markov head that corrects each beam parent.
+            # A draft without it (DFlash / DFlash2) expands the depth rows as-is.
             draft_model = model
         if (
             self.method == "prefix"
@@ -450,18 +506,40 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.tree_builder.freeze_scratch()
         ensure_finalize_scratch(self.max_num_reqs, self.device)
 
+    def _draft_logits_rows(
+        self,
+        sample_hidden_states: torch.Tensor,
+        num_reqs: int,
+        root_token_ids: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Return draft rows or DFlash2 candidate IDs and edge scores.
+
+        Three drafts, three sources: DSpark projects with
+        ``compute_draft_logits``, plain DFlash uses its own draft head through
+        ``compute_logits``, and DFlash2 replaces both with the candidate
+        selector, whose edge scores retain their predecessor axis.
+        """
+        if self.dflash2_selector is not None:
+            return self.dflash2_selector.score(
+                self.model, sample_hidden_states, root_token_ids, num_reqs
+            )
+        if self.method == "beam":
+            logits = self.model.compute_draft_logits(sample_hidden_states)
+        else:
+            logits = self.model.compute_logits(sample_hidden_states)
+        return logits.view(num_reqs, self.num_speculative_steps, -1)
+
     def _run_prefix_finalize(self, num_reqs: int, *, graph_safe: bool) -> None:
-        """compute_logits + prefix build; captured as one NPUGraph per num_reqs."""
+        """Draft rows + prefix build; captured as one NPUGraph per num_reqs."""
         hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = hidden[self.sample_indices[:num_sample]]
-        logits = self.model.compute_logits(sample_hidden_states)
-        logits = logits.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
         nqp = self.num_query_per_req
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
             num_reqs, nqp
         )[:, 0]
+        logits = self._draft_logits_rows(sample_hidden_states, num_reqs, root_token_ids)
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
@@ -478,6 +556,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
 
     def _capture_prefix_graphs(self) -> None:
         if self.method != "prefix" or self.tree_builder is None:
+            return
+        if self.dflash2_selector is not None:
+            logger.info(
+                "Prefix tree capture skipped: DFlash2 draft rows come from the "
+                "candidate selector and run eagerly."
+            )
             return
         manager = self.query_cudagraph_manager
         if manager is None or not manager.needs_capture():
@@ -518,24 +602,42 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_sample = num_reqs * self.num_speculative_steps
         with nullcontext() if graph_safe else tree_time("beam_gather_hidden"):
             hidden = self._draft_hidden_buf[self.sample_indices[:num_sample]]
-        with nullcontext() if graph_safe else tree_time("beam_compute_logits"):
-            logits = self.model.compute_draft_logits(hidden)
         nqp = self.num_query_per_req
         roots = self.input_buffers.input_ids[: num_reqs * nqp].view(num_reqs, nqp)[:, 0]
+        with nullcontext() if graph_safe else tree_time("beam_compute_logits"):
+            draft_rows = self._draft_logits_rows(hidden, num_reqs, roots)
+        selector_kwargs = {}
+        if self.dflash2_selector is not None:
+            candidate_ids, selector_scores = draft_rows
+            logits = None
+            selector_kwargs = {
+                "candidate_ids": candidate_ids,
+                "selector_scores": selector_scores,
+                "candidate_vocab_size": self.dflash2_selector.vocab_size,
+            }
+        else:
+            logits = draft_rows
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
         self.tree = self.tree_builder.build(
-            logits.view(num_reqs, self.num_speculative_steps, -1),
+            logits,
             self._load_layout_from_buffers(num_reqs),
             root_token_ids=roots,
             draft_hidden=hidden.view(num_reqs, self.num_speculative_steps, -1),
             proposal_logits=proposal,
             graph_safe=graph_safe,
+            **selector_kwargs,
         )
 
     def _capture_beam_graphs(self) -> None:
         if self.method != "beam" or self.tree_builder is None:
+            return
+        if self.dflash2_selector is not None:
+            logger.info(
+                "Beam tree capture skipped: DFlash2 draft rows come from the "
+                "candidate selector and run eagerly."
+            )
             return
         manager = self.query_cudagraph_manager
         if manager is None or not manager.needs_capture():
@@ -670,13 +772,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = hidden[self.sample_indices[:num_sample]]
-        logits = self.model.compute_logits(sample_hidden_states)
-        logits = logits.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
         nqp = self.num_query_per_req
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
             num_reqs, nqp
         )[:, 0]
+        logits = self._draft_logits_rows(sample_hidden_states, num_reqs, root_token_ids)
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]

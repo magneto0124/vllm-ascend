@@ -7,11 +7,14 @@ from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 SUPPORTED_TREE_METHODS: tuple[str, ...] = ("priority", "beam", "prefix")
 
-# tree_spec_config.method -> required speculative draft backend
-METHOD_REQUIRED_BACKEND: dict[str, str] = {
-    "priority": "dflash",
-    "beam": "dspark",
-    "prefix": "dflash",
+# tree_spec_config.method -> speculative draft backends that can expand the tree.
+# ``beam`` was DSpark-only while it relied on the Markov head to correct each
+# parent; a draft without that head (DFlash / DFlash2) expands its depth rows
+# directly, so it is allowed here too.
+METHOD_REQUIRED_BACKEND: dict[str, tuple[str, ...]] = {
+    "priority": ("dflash",),
+    "beam": ("dspark", "dflash"),
+    "prefix": ("dflash",),
 }
 
 _shared_req_arange: torch.Tensor | None = None
@@ -111,17 +114,18 @@ class TreeBuilder(ABC):
 
 
 def validate_tree_method_backend(method: str, draft_backend: str) -> None:
-    """Raise if ``tree_spec_config.method`` does not match draft backend."""
+    """Raise if ``tree_spec_config.method`` cannot run on ``draft_backend``."""
     required = METHOD_REQUIRED_BACKEND.get(method)
     if required is None:
         raise ValueError(
             f"tree_spec_config.method must be one of {SUPPORTED_TREE_METHODS}, "
             f"got {method!r}"
         )
-    if draft_backend != required:
+    if draft_backend not in required:
+        allowed = " or ".join(repr(backend) for backend in required)
         raise ValueError(
             f"tree_spec_config.method={method!r} requires "
-            f"speculative_config method {required!r}, got {draft_backend!r}"
+            f"speculative_config method {allowed}, got {draft_backend!r}"
         )
 
 

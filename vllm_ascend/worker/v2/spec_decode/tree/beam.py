@@ -16,8 +16,9 @@ def _markov_correct_logits(
 
     When ``draft_model`` is set, mirrors ``DSparkSpeculator._sample_sequential``:
     bias from the previous **target-vocab** token via ``markov_embed`` +
-    ``markov_bias``. When ``draft_model`` is None, expand the shared-depth base
-    logits across the frontier.
+    ``markov_bias``. When ``draft_model`` is None -- DSpark's head is absent, as
+    on a DFlash / DFlash2 draft -- expand the shared-depth base logits across the
+    frontier.
     """
     base = depth_logits.unsqueeze(1)
     if draft_model is None:
@@ -28,10 +29,38 @@ def _markov_correct_logits(
     return base + bias.view(*markov_emb.shape[:-1], -1)
 
 
-class BeamTreeBuilder(TreeBuilder):
-    """Level-wise beam (PCTree) expansion; optional DSpark Markov bias."""
+def _dflash2_parent_logits(
+    candidate_ids: torch.Tensor,
+    selector_scores: torch.Tensor,
+    depth: int,
+    frontier_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select each frontier parent's DFlash2 edge scores and child token IDs."""
+    batch = frontier_tokens.shape[1]
+    if depth == 0:
+        predecessor_slots = torch.zeros(
+            (*frontier_tokens.shape,), dtype=torch.long, device=frontier_tokens.device
+        )
+    else:
+        previous_ids = candidate_ids[:, depth - 1]
+        predecessor_slots = (frontier_tokens.unsqueeze(-1) == previous_ids.unsqueeze(1)).to(
+            torch.int32
+        ).argmax(dim=-1)
+    depth_scores = selector_scores[:, depth].unsqueeze(2)
+    selected_scores = depth_scores.gather(
+        1,
+        predecessor_slots[..., None, None].expand(
+            -1, -1, 1, depth_scores.shape[-1]
+        ),
+    ).squeeze(2)
+    child_ids = candidate_ids[:, depth].unsqueeze(1).expand(-1, batch, -1)
+    return selected_scores, child_ids
 
-    required_backend = "dspark"
+
+class BeamTreeBuilder(TreeBuilder):
+    """Level-wise beam expansion for DSpark, DFlash and DFlash2 drafts."""
+
+    required_backend = "dspark or dflash"
     method = "beam"
 
     def __init__(self, budget: int, topk: int, draft_model=None):
@@ -118,15 +147,32 @@ class BeamTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        candidate_ids: torch.Tensor | None = None,
+        selector_scores: torch.Tensor | None = None,
+        candidate_vocab_size: int | None = None,
         graph_safe: bool = False,
     ) -> TreeLayout:
         tick = (lambda _segment: nullcontext()) if graph_safe else tree_time
         budget = self.budget
         topk = self.topk
         draft_model = self.draft_model
-        num_reqs, spec_num, vocab = draft_logits.shape
-        k = min(topk, vocab)
-        device = draft_logits.device
+        dflash2 = candidate_ids is not None or selector_scores is not None
+        if dflash2:
+            if candidate_ids is None or selector_scores is None or draft_model is not None:
+                raise ValueError("DFlash2 beam needs candidate ids/scores and no Markov model")
+            num_reqs, spec_num, selector_topk = candidate_ids.shape
+            expected_shape = (num_reqs, spec_num, selector_topk, selector_topk)
+            if selector_scores.shape != expected_shape:
+                raise ValueError("DFlash2 selector scores must have shape [R, D, K, K]")
+            if candidate_vocab_size is None:
+                raise ValueError("DFlash2 beam requires candidate_vocab_size")
+            vocab = candidate_vocab_size
+            device = candidate_ids.device
+            k = min(topk, selector_topk)
+        else:
+            num_reqs, spec_num, vocab = draft_logits.shape
+            device = draft_logits.device
+            k = min(topk, vocab)
         need_proposal = proposal_logits is not None
         with tick("beam_scratch"):
             self._ensure_scratch(
@@ -176,13 +222,26 @@ class BeamTreeBuilder(TreeBuilder):
             batch = 1 if depth == 0 else k
             frontier = frontier_tokens[:, :batch]
             with tick("beam_markov_logits"):
-                step_logits = _markov_correct_logits(
-                    draft_model, draft_logits[:, depth], frontier
-                )
+                if dflash2:
+                    step_logits, step_ids = _dflash2_parent_logits(
+                        candidate_ids, selector_scores, depth, frontier
+                    )
+                else:
+                    step_logits = _markov_correct_logits(
+                        draft_model, draft_logits[:, depth], frontier
+                    )
             if prop_temp is not None:
                 with tick("beam_proposal_store"):
                     req_idx = torch.arange(num_reqs, device=device)
-                    step_f = step_logits.to(dtype=prop_temp.dtype)
+                    if dflash2:
+                        step_f = torch.full(
+                            (num_reqs, batch, vocab),
+                            float("-inf"),
+                            dtype=prop_temp.dtype,
+                            device=device,
+                        ).scatter(-1, step_ids, step_logits.to(dtype=prop_temp.dtype))
+                    else:
+                        step_f = step_logits.to(dtype=prop_temp.dtype)
                     for j in range(batch):
                         parent_pool = frontier_pools[:, j]
                         temp_id = torch.where(
@@ -193,7 +252,8 @@ class BeamTreeBuilder(TreeBuilder):
                         prop_temp[req_idx, temp_id] = step_f[:, j]
             with tick("beam_softmax_topk"):
                 log_probs = torch.log_softmax(step_logits.float(), dim=-1)
-                top_vals, top_ids = log_probs.topk(k, dim=-1)
+                top_vals, top_slots = log_probs.topk(k, dim=-1)
+                top_ids = torch.gather(step_ids, -1, top_slots) if dflash2 else top_slots
                 if draft_model is not None:
                     top_ids = draft_model.map_draft_to_target(top_ids)
             with tick("beam_pool_write"):

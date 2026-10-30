@@ -28,9 +28,12 @@ def init_speculator(
 ):
     """Override GPU init_speculator for Ascend NPUs.
 
-    DFlash (``priority`` / ``prefix``) and Qwen3 DSpark (``beam``) use
-    ``AscendTreeSpeculator`` when ``tree_spec_config.enabled`` is true.
-    Method/backend pairing is validated inside the tree host.
+    DFlash (``priority`` / ``prefix`` / ``beam``), DFlash2 and Qwen3 DSpark
+    (``beam``) use ``AscendTreeSpeculator`` when ``tree_spec_config.enabled`` is
+    true. The tree host picks the draft scoring path itself: DFlash2 scores
+    through its candidate selector, DSpark through ``compute_draft_logits`` and
+    plain DFlash through ``compute_logits``. Method/backend pairing is validated
+    inside the tree host.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None

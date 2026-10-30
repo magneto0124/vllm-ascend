@@ -1051,7 +1051,9 @@ class TreeSpecConfig:
     ``speculative_config.method`` (draft backend):
 
     - ``priority`` → ``dflash`` (best-first expansion)
-    - ``beam`` → ``dspark`` (level-wise beam / PCTree; Markov on Qwen3 DSpark)
+    - ``beam`` → ``dspark`` or ``dflash`` (level-wise beam / PCTree; Qwen3
+      DSpark's Markov head corrects each parent when present, while DFlash /
+      DFlash2 expand their per-depth rows directly)
     - ``prefix`` → ``dflash`` (uniform-width supertree + Top-B prune; Domino
       ``embed_proj`` / ``prefix_gru`` when ``projector_type=domino``;
       ``shift_label=true`` samples the bonus hidden as draft slot 0)
