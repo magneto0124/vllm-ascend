@@ -36,6 +36,7 @@ from vllm.config import (
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.attention import Attention
@@ -247,7 +248,7 @@ def _align_tree_mamba_page_size(page_size: int, spec: MambaSpec, vllm_config: Vl
 
 
 def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
-    """Allocate one recurrent state page and conv column per tree node."""
+    """Reserve tree convolution columns and recurrent state or replay slots."""
     from vllm_ascend.models.qwen_gdn_recoverssm import _uses_gdn_recoverssm
     from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
         tree_conv_width,
@@ -259,10 +260,15 @@ def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> Mamb
     if slots is None:
         return spec
     validate_tree_state_slots(slots, spec.mamba_type)
-    if getattr(vllm_config.cache_config, "use_replayssm", False) and _uses_gdn_recoverssm(vllm_config):
-        raise NotImplementedError("Qwen GDN RecoverSSM is not yet wired into MRV2 tree speculative decoding.")
+    recover_tree = getattr(vllm_config.cache_config, "use_replayssm", False) and _uses_gdn_recoverssm(vllm_config)
+    if recover_tree:
+        if vllm_config.compilation_config.cudagraph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY):
+            raise NotImplementedError("Tree GDN RecoverSSM supports FULL_DECODE_ONLY ACLGraph or eager execution.")
+        if vllm_config.kv_transfer_config is not None:
+            raise NotImplementedError("Tree GDN RecoverSSM currently requires local state without KV transfer.")
+        spec = replace(spec, num_speculative_blocks=0)
     num_spec = vllm_config.speculative_config.num_speculative_tokens
-    if slots > spec.num_speculative_blocks + 1:
+    if not recover_tree and slots > spec.num_speculative_blocks + 1:
         spec = replace(spec, num_speculative_blocks=slots - 1)
     conv_shape = tuple(spec.shapes[0])
     width = tree_conv_width(spec.mamba_type, conv_shape, num_spec)
@@ -272,10 +278,17 @@ def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> Mamb
     conv_dim = max(conv_shape)
     expected_columns = width - 1 + slots
     conv_shape = (conv_dim, expected_columns) if is_conv_state_dim_first() else (expected_columns, conv_dim)
-    expanded_page_size = spec.page_size_padded + extra_columns * conv_dim * get_dtype_size(spec.dtypes[0])
+    shapes = (conv_shape, *spec.shapes[1:])
+    expanded_page_size = (spec.page_size_padded or spec.real_page_size_bytes) + (
+        extra_columns * conv_dim * get_dtype_size(spec.dtypes[0])
+    )
+    if recover_tree:
+        heads, replay_slots, record_width = spec.shapes[2]
+        shapes = (conv_shape, spec.shapes[1], (heads, slots, record_width))
+        expanded_page_size += heads * (slots - replay_slots) * record_width * get_dtype_size(spec.dtypes[2])
     return replace(
         spec,
-        shapes=(conv_shape, *spec.shapes[1:]),
+        shapes=shapes,
         page_size_padded=_align_tree_mamba_page_size(expanded_page_size, spec, vllm_config),
     )
 

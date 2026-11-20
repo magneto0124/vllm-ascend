@@ -111,6 +111,7 @@ class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
     tree_prev_num_sampled: torch.Tensor | None = None
     tree_depths: torch.Tensor | None = None
     share_tree_metadata: bool = False
+    tree_full_graph: bool = False
     tree_request_id: str | None = None
     shared_gdn_tree: "SharedGDNTreeMetadata | None" = None
 
@@ -139,6 +140,9 @@ class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
         if self.tree_prev_path is not None and self.tree_prev_num_sampled is not None:
             kwargs["prev_path_node_ids"] = self.tree_prev_path[:num_reqs]
             kwargs["prev_num_sampled"] = self.tree_prev_num_sampled[:num_reqs]
+        if attn_metadata_builder._TREE_RECOVERSSM:
+            kwargs["tree_full_graph"] = self.tree_full_graph
+            return kwargs
         if (
             self.share_tree_metadata
             and self.tree_depths is not None
@@ -667,6 +671,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             tree_prev_path=tree_prev_path,
             tree_prev_num_sampled=tree_prev_num_sampled,
             tree_depths=getattr(input_batch, "tree_depths", None),
+            tree_full_graph=cudagraph_mode == CUDAGraphMode.FULL,
             # Only a real, complete BS1 FULL verify uses this fast path.
             # Capture/dummy/prefill/truncated rows retain the existing builder.
             share_tree_metadata=(
@@ -832,6 +837,20 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
     ) -> None:
         resume_column = self._tree_resume_column
         path = self._tree_path
+        tree_rows = self._tree_is_tree_row
+        if path is not None and self.recoverssm is not None:
+            # The RecoverSSM coordinator already owns the per-group callback.
+            # Supply the same sampler path to all groups before it runs.
+            from vllm_ascend.attention.gdn_recoverssm_metadata import AscendGDNRecoverSSMMetadata
+
+            group_metadata = {id(meta): meta for meta in self.attn_metadata.values()}
+            for meta in group_metadata.values():
+                if isinstance(meta, AscendGDNRecoverSSMMetadata) and meta.node_path_slots is not None:
+                    meta.stage_tree_commit(path, idx_mapping)
+                    # Even a one-token tree verify records the root activation
+                    # as a node column. Re-anchor convolution on it next round.
+                    tree_rows = meta.spec_sequence_masks
+                    resume_column = num_sampled
         # Native chain decoding retains the upstream state lifecycle.
         if resume_column is None and path is None and self._tree_prev_path is None:
             super().postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
@@ -843,6 +862,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             and idx_mapping.device.type == "npu"
             and path is not None
             and self._tree_num_sampled is not None
+            and self.recoverssm is None
             and not self.vllm_config.speculative_config.enforce_eager
             and self.vllm_config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
@@ -857,7 +877,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 resume_column,
                 path,
                 self._tree_num_sampled,
-                self._tree_is_tree_row,
+                tree_rows,
                 num_computed_tokens,
             )
         if not committed:
@@ -866,7 +886,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 resume_column if resume_column is not None else num_sampled,
                 path,
                 self._tree_num_sampled,
-                self._tree_is_tree_row,
+                tree_rows,
                 num_computed_tokens,
             )
         self._tree_resume_column = None
@@ -912,6 +932,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 builder = attn_group.get_metadata_builder(0)
                 if (
                     isinstance(builder, AscendGDNAttentionMetadataBuilder)
+                    and not builder._TREE_RECOVERSSM
                     and builder.spec_tree_slots == metadata.tree_parents.shape[1] + 1
                     and builder.spec_conv_width is not None
                 ):

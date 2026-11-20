@@ -135,7 +135,7 @@ def tensor_layout_supported(
     rows = query_start_loc.numel() - 1
     if rows < 1 or prefix_src.shape[0] < rows:
         return False
-    if cache_indices.dim() != 2 or not cache_indices.is_contiguous() or cache_indices.shape[0] < rows:
+    if cache_indices.dim() not in (1, 2) or not cache_indices.is_contiguous() or cache_indices.shape[0] < rows:
         return False
     # The reserved node columns must hold every token, else a row would lose
     # tokens to the loop bound instead of being reported.
@@ -172,6 +172,7 @@ def _tree_conv_kernel(
     width: tl.constexpr,
     has_bias: tl.constexpr,
     with_activation: tl.constexpr,
+    REQUEST_PAGES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Anchor one request's history and emit every node's short-conv output.
@@ -191,9 +192,10 @@ def _tree_conv_kernel(
     end = tl.load(query_start_loc_ptr + row + 1).to(tl.int64)
     # A zero-length row is a full-graph padding request: it owns no page.
     live = channel & (end > start)
-    # ``cache_indices`` is packed token-major, so a request's page sits at its
-    # first token. Padding rows may carry a null page; clamp for the address.
-    page = tl.maximum(tl.load(cache_ptr + tl.minimum(start, cache_last)).to(tl.int64), 0)
+    page_offset = row if REQUEST_PAGES else tl.minimum(start, cache_last)
+    page = tl.maximum(tl.load(cache_ptr + page_offset).to(tl.int64), 0)
+    if REQUEST_PAGES:
+        live = live & (page > 0)
     base = state_ptr + page * stride_page + lane.to(tl.int64) * stride_dim
 
     # Anchor: stage every committed column in registers, then store. Two columns
@@ -246,6 +248,8 @@ def _tree_conv_kernel(
     # node walk; a full-graph batch keeps the whole reserved width.
     for node in range(0, nodes):
         row_live = node < end - start
+        if REQUEST_PAGES:
+            row_live = row_live & (page > 0)
         node_live = channel & row_live
         # ``node`` walks the request's reserved node columns, so a short row
         # leaves trailing iterations without a token; they read a clamped token
@@ -254,7 +258,7 @@ def _tree_conv_kernel(
         # Match the native kernel: FP32 products and accumulation in tap order.
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         for tap in tl.static_range(width):
-            source = tl.load(window_ptr + token * width + tap).to(tl.int64)
+            source = tl.load(window_ptr + token * width + tap, mask=row_live, other=0).to(tl.int64)
             column = source - history_base
             committed = source < history_rows
             # A committed tap is one of the anchored columns, which are still in
@@ -363,6 +367,7 @@ def tree_causal_conv1d_triton(
         width=width,
         has_bias=bias is not None,
         with_activation=bool(activation),
+        REQUEST_PAGES=cache_indices.ndim == 1,
         BLOCK=channels,
         num_warps=_num_warps(channels),
     )

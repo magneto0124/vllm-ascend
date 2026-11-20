@@ -245,6 +245,8 @@ def tree_causal_conv1d(
     prefix_src: torch.Tensor,
     bias: torch.Tensor | None,
     activation: bool,
+    *,
+    require_triton: bool = False,
 ) -> torch.Tensor:
     """Causal short conv over each tree node's own root-to-node ancestors.
 
@@ -276,14 +278,20 @@ def tree_causal_conv1d(
             bias,
             activation,
         )
+    if require_triton:
+        raise RuntimeError("Tree GDN RecoverSSM ACLGraph requires the fused tree short convolution.")
     width = weight.shape[1]
     conv_dim = weight.shape[0]
     starts = query_start_loc.to(torch.long).reshape(-1)
     rows = starts.numel() - 1
     # cache_indices is packed token-major (a request's page sits at its token start);
     # full-graph padding rows own no page and are skipped below.
-    pages = cache_indices.reshape(-1)[starts[:rows]].to(torch.long).clamp(min=0)
     valid = torch.diff(starts) > 0
+    if cache_indices.ndim == 1:
+        pages = cache_indices[:rows].to(torch.long).clamp(min=0)
+        valid = valid & (pages > 0)
+    else:
+        pages = cache_indices.reshape(-1)[starts[:rows]].to(torch.long).clamp(min=0)
     # Keep the row count fixed for graph capture: a boolean index would give a dynamic
     # shape, so inactive rows keep a harmless page and are masked below.
     page_ids = pages
@@ -719,6 +727,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         has_spec_decode = attn_metadata.num_spec_decodes > 0
+        tree_recovery_graph = getattr(attn_metadata, "tree_full_graph", False)
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
@@ -776,6 +785,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     spec_meta.conv_prefix_src,
                     self.conv1d.bias,
                     self.activation,
+                    require_triton=tree_recovery_graph,
                 )
             else:
                 output_spec = torch.empty_like(mixed_qkv_spec)
@@ -1007,14 +1017,57 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     replay_cache=self_kv_cache[2],
                     query_start_loc=spec_causal_conv1d_meta.query_start_loc,
                     state_indices=spec_state_indices_tensor[:, 0],
-                    spec_query_len=self.num_spec + 1,
+                    spec_query_len=self_kv_cache[2].shape[2],
+                    node_path_slots=attn_metadata.node_path_slots,
+                    node_path_lengths=attn_metadata.node_path_lengths,
+                    out=torch.zeros_like(value_spec, memory_format=torch.contiguous_format)
+                    if tree_recovery_graph
+                    else None,
                 )
             else:
                 assert g_spec is not None
                 assert beta_spec is not None
                 query_spec = l2norm_fwd(query_spec)
                 key_spec = l2norm_fwd(key_spec)
-                if use_upstream_recurrent:
+                actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+                init_state_indices = attn_metadata.spec_decode_metadata.init_state_indices
+                verify_plan = attn_metadata.spec_decode_metadata.verify_plan
+                if verify_plan is not None:
+                    core_attn_out_spec = _chunked_tree_verify(
+                        query_spec,
+                        key_spec,
+                        value_spec,
+                        g_spec,
+                        beta_spec,
+                        ssm_state,
+                        spec_state_indices_tensor,
+                        spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                        scale=key_spec.shape[-1] ** -0.5,
+                        plan=verify_plan,
+                        num_actual_tokens=num_actual_tokens,
+                    ).unsqueeze(0)
+                elif init_state_indices is not None:
+                    recurrent_kwargs = dict(
+                        g=g_spec.squeeze(0),
+                        beta=beta_spec.squeeze(0),
+                        scale=key_spec.shape[-1] ** -0.5,
+                        actual_seq_lengths=actual_seq_lengths,
+                        ssm_state_indices=_flatten_recurrent_state_indices(
+                            spec_state_indices_tensor,
+                            query_spec.shape[1],
+                            spec_causal_conv1d_meta.query_start_loc,
+                        ),
+                        num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                    )
+                    recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
+                    core_attn_out_spec = _gdn_tree_op(
+                        query=query_spec.squeeze(0),
+                        key=key_spec.squeeze(0),
+                        value=value_spec.squeeze(0),
+                        state=ssm_state,
+                        **recurrent_kwargs,
+                    ).unsqueeze(0)
+                elif use_upstream_recurrent:
                     # The native packed-index API bounds accepted_prev by the
                     # current query length. Reuse vLLM's strided state-table API
                     # for adaptive graphs, whose next query may be only one token.

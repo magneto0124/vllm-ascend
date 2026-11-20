@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cache binding and commit orchestration for GDN RecoverSSM."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -212,6 +214,12 @@ def _validate_layer_caches(
 
 
 @dataclass
+class _GDNTreeCommitGraph:
+    graph: torch.npu.NPUGraph
+    inputs: tuple[torch.Tensor, ...]
+
+
+@dataclass
 class GDNRecoverSSMCommitContext:
     layer_caches: tuple[GDNRecoverSSMLayerCache, ...]
     commit_plan: GDNRecoverSSMCommitPlan
@@ -234,6 +242,7 @@ class GDNRecoverSSMCommitContext:
     # Device-side int64 table [2, 2, num_layers]: checkpoint/replay,
     # base address/block stride in elements, layer index.
     _state_commit_cache_address_stride_table: torch.Tensor = field(repr=False)
+    _tree_commit_graphs: dict[tuple, _GDNTreeCommitGraph] = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def create(
@@ -271,9 +280,17 @@ class GDNRecoverSSMCommitContext:
         num_computed_tokens: torch.Tensor | None = None,
         mamba_block_size: int | None = None,
         commit_conv: bool = True,
+        path_record_indices: torch.Tensor | None = None,
     ) -> None:
         """Commit each request's accepted prefix into every bound GDN layer."""
         align_mode = block_table is not None
+        commit_capacity = self.spec_query_len
+        if path_record_indices is not None:
+            if align_mode or commit_conv:
+                raise ValueError("Tree GDN RecoverSSM commits SSM only in Mamba cache mode none")
+            if path_record_indices.ndim != 2 or not 1 <= path_record_indices.shape[1] <= self.spec_query_len:
+                raise ValueError("GDN RecoverSSM commit path exceeds the replay capacity")
+            commit_capacity = path_record_indices.shape[1]
         if block_table is not None:
             if num_computed_tokens is None or mamba_block_size is None:
                 raise ValueError("GDN RecoverSSM align metadata is incomplete")
@@ -318,7 +335,7 @@ class GDNRecoverSSMCommitContext:
             plan.final_state_indices,
             plan.boundary_state_indices,
             plan.boundary_recovery_lens,
-            spec_query_len=self.spec_query_len,
+            spec_query_len=commit_capacity,
             null_block_id=0,
             request_indices=request_indices,
             block_table=block_table,
@@ -353,6 +370,32 @@ class GDNRecoverSSMCommitContext:
             plan.final_state_indices,
             plan.boundary_state_indices,
             plan.boundary_recovery_lens,
-            spec_query_len=self.spec_query_len,
+            spec_query_len=commit_capacity,
             align_mode=align_mode,
+            path_record_indices=path_record_indices,
         )
+
+    def commit_tree_graph(
+        self,
+        accepted_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        path_record_indices: torch.Tensor,
+    ) -> None:
+        """Replay the post-sampling state commit with stable, group-local inputs."""
+        inputs = (accepted_lengths, state_indices, query_start_loc, path_record_indices)
+        key = tuple((tensor.shape, tensor.dtype) for tensor in inputs)
+        entry = self._tree_commit_graphs.get(key)
+        if entry is None:
+            pending = tuple(torch.zeros_like(tensor, memory_format=torch.contiguous_format) for tensor in inputs)
+            graph = torch.npu.NPUGraph()
+            # Warm up and capture with null pages and zero lengths. The plan
+            # buffers are initialized without mutating any request checkpoint.
+            self.commit(*pending[:3], commit_conv=False, path_record_indices=pending[3])
+            with torch.npu.graph(graph):
+                self.commit(*pending[:3], commit_conv=False, path_record_indices=pending[3])
+            entry = _GDNTreeCommitGraph(graph, pending)
+            self._tree_commit_graphs[key] = entry
+        for stable, current in zip(entry.inputs, inputs):
+            stable.copy_(current, non_blocking=True)
+        entry.graph.replay()
