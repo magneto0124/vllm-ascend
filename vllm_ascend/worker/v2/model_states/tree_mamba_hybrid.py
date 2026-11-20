@@ -32,7 +32,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
 if TYPE_CHECKING:
-    from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
+    from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
     from vllm_ascend.ops.triton.spec_decode.tree.gdn_tree_pages import GDNTreePagePointers
     from vllm_ascend.worker.v2.spec_decode.tree.acceptance import TreeAcceptance
     from vllm_ascend.worker.v2.spec_decode.tree.metrics import TreeGraphStats
@@ -83,7 +83,7 @@ class AscendTreeMambaHybridAttnMetadata(MambaHybridAttnMetadata):
         if not kwargs or self.tree_parents is None:
             return kwargs
         # Lazy import to avoid a model-state <-> attention-builder cycle.
-        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+        from vllm_ascend.attention.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 
         if not isinstance(attn_metadata_builder, AscendGDNAttentionMetadataBuilder):
             # Mamba2 / short-conv have no draft-tree state rollback.
@@ -158,7 +158,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
         previous = self._gdn_tree_graph_groups
         if previous is not None and previous[0] is attn_groups and previous[1] == full_row:
             return previous[2]
-        from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
+        from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
         from vllm_ascend.ops.triton.spec_decode.tree.gdn_tree_pages import GDNTreePageBatch
 
         refresh_builders = {}
@@ -489,7 +489,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             return
         # Lazy imports to keep the model-state <-> attention-builder cycle
         # out of the module level (same reason as get_extra_attn_kwargs).
-        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+        from vllm_ascend.attention.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
         from vllm_ascend.ops.triton.spec_decode.tree.gdn_tree_pages import GDNTreePageBatch, GDNTreePagePointers
         from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
 

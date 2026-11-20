@@ -361,31 +361,30 @@ def _commit_gdn_state_grouped_kernel(
     if ALIGN_MODE:
         boundary_decay = tl.full([BH, BK], 1.0, tl.float32)
         boundary_correction = tl.zeros([BH, BV, BK], tl.float32)
-    for token_offset in tl.static_range(SPEC_QUERY_LEN):
-        if token_offset < commit_len:
-            path_pos = commit_len - token_offset - 1
-            token_record_pos = _gdn_commit_record_position(path_ptr, pid_b, path_pos, stride_path_row, stride_path_pos)
-            record_ptr = replay_ptr + token_record_pos * stride_replay_pos
-            correction, normalized_k, decay = _load_gdn_commit_record(
-                record_ptr=record_ptr[:, None],
-                offs_k=offs_k[None, :],
-                offs_v=offs_v[None, :],
-                mask_k=mask_k,
-                mask_v=mask_v,
-                stride_replay_dim=stride_replay_dim,
-                K=K,
-                V=V,
-            )
-            weighted_k = normalized_k * final_decay
-            final_correction = tl.fma(correction[:, :, None], weighted_k[:, None, :], final_correction)
-            final_decay *= decay
-            if ALIGN_MODE:
-                # Non-crossing requests can still have a positive boundary length.
-                # Check the destination as well, and skip unused matrix updates.
-                if need_boundary & (path_pos < boundary_recovery_len):
-                    boundary_k = normalized_k * boundary_decay
-                    boundary_correction = tl.fma(correction[:, :, None], boundary_k[:, None, :], boundary_correction)
-                    boundary_decay *= decay
+    for token_offset in range(tl.minimum(commit_len, SPEC_QUERY_LEN)):
+        path_pos = commit_len - token_offset - 1
+        token_record_pos = _gdn_commit_record_position(path_ptr, pid_b, path_pos, stride_path_row, stride_path_pos)
+        record_ptr = replay_ptr + token_record_pos * stride_replay_pos
+        correction, normalized_k, decay = _load_gdn_commit_record(
+            record_ptr=record_ptr[:, None],
+            offs_k=offs_k[None, :],
+            offs_v=offs_v[None, :],
+            mask_k=mask_k,
+            mask_v=mask_v,
+            stride_replay_dim=stride_replay_dim,
+            K=K,
+            V=V,
+        )
+        weighted_k = normalized_k * final_decay
+        final_correction = tl.fma(correction[:, :, None], weighted_k[:, None, :], final_correction)
+        final_decay *= decay
+        if ALIGN_MODE:
+            # Non-crossing requests can still have a positive boundary length.
+            # Check the destination as well, and skip unused matrix updates.
+            if need_boundary & (path_pos < boundary_recovery_len):
+                boundary_k = normalized_k * boundary_decay
+                boundary_correction = tl.fma(correction[:, :, None], boundary_k[:, None, :], boundary_correction)
+                boundary_decay *= decay
     initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None).to(tl.float32)
     state = initial_state * final_decay[:, None, :] + final_correction
     if ALIGN_MODE:
