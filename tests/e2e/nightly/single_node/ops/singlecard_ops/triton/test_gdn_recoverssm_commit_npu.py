@@ -57,6 +57,65 @@ def load_replay(replay, records):
         replay[page, :, : expected.shape[1]].copy_(expected.to(dtype=replay.dtype))
 
 
+@pytest.mark.parametrize("key,value", [(7, 5), (128, 128)])
+@pytest.mark.parametrize("align_mode", [False, True])
+def test_commit_selected_tree_paths(npu, record_property, key, value, align_mode):
+    heads, slots, depth = 2, 5, 3
+    generator = torch.Generator().manual_seed(42)
+    initial = torch.randn(heads, value, key, generator=generator)
+    keys = torch.nn.functional.normalize(torch.randn(slots, heads, key, generator=generator), dim=-1)
+    values = torch.randn(slots, heads, value, generator=generator)
+    decay = torch.linspace(0.5, 0.9, slots).view(slots, 1, 1)
+    records = torch.empty(slots, heads, value + key + 1)
+    states = {}
+    # The leading target uses slot 3. Its children use slots 1 and 0,
+    # and each child has one descendant. Slot order differs from path order.
+    for slot, parent in ((3, None), (1, 3), (0, 3), (4, 1), (2, 0)):
+        parent_state = initial if parent is None else states[parent]
+        decayed = parent_state * decay[slot].unsqueeze(-1)
+        normalized_key = keys[slot]
+        correction = 0.5 * (values[slot] - (decayed * normalized_key.unsqueeze(-2)).sum(-1))
+        states[slot] = decayed + correction.unsqueeze(-1) * normalized_key.unsqueeze(-2)
+        records[slot] = torch.cat((correction, normalized_key, decay[slot].expand(heads, 1)), dim=-1)
+
+    state = torch.full((8, heads, value, key), -5.0, device=npu)
+    state[1].copy_(initial)
+    replay = torch.zeros((8, heads, slots, value + key + 1), device=npu)
+    replay[1].copy_(records.transpose(0, 1))
+    path_storage = torch.full((4, depth * 2), -1, dtype=torch.int32, device=npu)
+    paths = path_storage[:, ::2]
+    paths.copy_(torch.tensor([[3, 1, 4], [3, 0, 2], [3, -1, -1], [-1, -1, -1]], device=npu))
+    source = torch.ones(4, dtype=torch.int32, device=npu)
+    lengths = torch.tensor([3, 3, 1, 0], dtype=torch.int32, device=npu)
+    final_pages = torch.arange(2, 6, dtype=torch.int32, device=npu)
+    boundary_pages = torch.tensor([6, 7, 0, 0], dtype=torch.int32, device=npu)
+    boundary_lengths = torch.tensor([2, 2, 0, 0], dtype=torch.int32, device=npu)
+
+    gdn.gdn_recoverssm_commit(
+        state,
+        replay,
+        state_address_table(state, replay),
+        source,
+        lengths,
+        final_pages,
+        boundary_pages,
+        boundary_lengths,
+        spec_query_len=depth,
+        align_mode=align_mode,
+        path_record_indices=paths,
+    )
+
+    for page, slot in ((2, 4), (3, 2), (4, 3)):
+        check_accuracy(state[page], states[slot], record_property, f"tree_final_{page}")
+    if align_mode:
+        for page, slot in ((6, 1), (7, 0)):
+            check_accuracy(state[page], states[slot], record_property, f"tree_boundary_{page}")
+    else:
+        assert (state[6:] == -5).all()
+    assert (state[5] == -5).all()
+    torch.testing.assert_close(state[1].cpu(), initial, atol=0, rtol=0)
+
+
 def test_commit_preserves_head_padding(npu, record_property):
     hk, hv, key, value, spec_query_len = 4, 8, 128, 128, 3
     layer, checkpoint_storage, replay_storage = padded_layer(npu, hv, key, value, spec_query_len)

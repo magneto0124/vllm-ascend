@@ -28,6 +28,13 @@ S_accepted = S_checkpoint * F + R
 This is algebraically the forward recurrence, but changes floating-point
 evaluation order. BF16 checkpoint storage rounds the reconstructed FP32 result.
 
+For a tree, pass `path_record_indices` to map each accepted path position to
+its replay slot. For example, a path `[3, 1, 4]` reads slots 4, 1, and 3 in
+reverse. An align boundary at length 2 uses slots 1 and 3. The boundary length
+counts positions along the path. The caller includes the leading target step if
+it was verified from the checkpoint and can pad unused path positions with
+`-1`. A row with commit length zero leaves its destination untouched.
+
 Each record contains correction `u`, effective key `k_hat`, and scalar decay
 `d`. The caller prepares accepted lengths and page IDs with
 [prepare_commit_plan](prepare_commit_plan.md). The
@@ -67,7 +74,8 @@ layer count. The wrapper returns `None` after scheduling the in-place update.
 | `state_indices` | Input | Source page IDs | INT32 or INT64 | Strided `[B]` |
 | `commit_lens`, `final_state_indices` | Input | Full accepted length and final page per row | INT32 | Contiguous plan vectors |
 | `boundary_state_indices`, `boundary_recovery_lens` | Input | Boundary page and its accepted length per row | INT32 | Contiguous plan vectors |
-| `spec_query_len` | Attribute | Replay capacity `Q` | Python int | Positive scalar |
+| `path_record_indices` | Optional input | Replay slot IDs in execution order. Each active entry is in `[0, Q)` | INT32 or INT64 | Strided `[B, path_width]` with `path_width >= spec_query_len` |
+| `spec_query_len` | Attribute | Maximum commit length. Use replay capacity `Q` for contiguous windows or the maximum path length for trees | Python int | Positive scalar |
 | `align_mode` | Attribute | Enables boundary checkpoint recovery | Python bool | Scalar |
 
 ## Constraints
