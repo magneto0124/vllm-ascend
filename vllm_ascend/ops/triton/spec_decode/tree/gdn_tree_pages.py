@@ -9,7 +9,7 @@ from vllm.triton_utils import tl, triton
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-    from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
+    from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
 
 
 @triton.jit

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single-launch draft-tree short conv behind ``tree_causal_conv1d``.
 
-``vllm_ascend.ops.gdn.tree_causal_conv1d`` writes one node's causal window as a
+``vllm_ascend.attention.gdn.tree_causal_conv1d`` writes one node's causal window as a
 chain of Torch ops: gather the page rows, permute the committed history in
 place, transpose it to tap-major, concatenate this step's activations, gather
 every token's taps, then upcast and reduce. Each stage moves the same
@@ -319,7 +319,7 @@ def tree_causal_conv1d_triton(
 ) -> torch.Tensor:
     """Fused draft-tree short conv: anchored history plus per-node windows.
 
-    Same contract as :func:`vllm_ascend.ops.gdn.tree_causal_conv1d`: ``x`` is
+    Same contract as :func:`vllm_ascend.attention.gdn.tree_causal_conv1d`: ``x`` is
     ``[tokens, conv_dim]`` sequence-major, ``weight`` is the kernel-layout
     ``[conv_dim, width]`` view, and the returned tensor is ``[tokens,
     conv_dim]``. Mutates ``conv_state`` in place: the committed history columns

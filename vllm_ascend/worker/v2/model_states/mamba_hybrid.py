@@ -49,7 +49,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 if TYPE_CHECKING:
-    from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
+    from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
     from vllm_ascend.worker.v2.spec_decode.tree.acceptance import TreeAcceptance
     from vllm_ascend.worker.v2.spec_decode.tree.metrics import TreeGraphStats
@@ -123,7 +123,7 @@ class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
         if not kwargs or self.tree_parents is None:
             return kwargs
         # Lazy import to avoid a model-state <-> attention-builder cycle.
-        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+        from vllm_ascend.attention.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 
         if not isinstance(attn_metadata_builder, AscendGDNAttentionMetadataBuilder):
             # Mamba2 / short-conv have no draft-tree state rollback.
@@ -200,7 +200,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         previous = getattr(self, "_gdn_tree_graph_groups", None)
         if previous is not None and previous[0] is attn_groups and previous[1:3] == (full_row, tree_slots):
             return previous[3]
-        from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
+        from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
 
         pools = getattr(self, "_gdn_tree_graph_pools", None)
         if pools is None:
@@ -903,7 +903,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             return
         # Lazy imports to keep the model-state <-> attention-builder cycle
         # out of the module level (same reason as get_extra_attn_kwargs).
-        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+        from vllm_ascend.attention.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
         from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
 
         conv_width = None

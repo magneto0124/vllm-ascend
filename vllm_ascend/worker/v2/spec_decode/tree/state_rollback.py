@@ -501,7 +501,7 @@ class TreeVerifyPlan:
     """Chunked recurrent verify of one draft-tree step.
 
     Built by :func:`compute_tree_verify_plan`; consumed by
-    ``vllm_ascend.ops.gdn`` (the chunk loop) and by
+    ``vllm_ascend.attention.gdn`` (the chunk loop) and by
     ``AscendGDNAttentionMetadataBuilder`` (stable buffers for graph capture).
     """
 

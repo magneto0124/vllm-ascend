@@ -248,6 +248,7 @@ def _align_tree_mamba_page_size(page_size: int, spec: MambaSpec, vllm_config: Vl
 
 def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
     """Allocate one recurrent state page and conv column per tree node."""
+    from vllm_ascend.models.qwen_gdn_recoverssm import _uses_gdn_recoverssm
     from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
         tree_conv_width,
         tree_state_slot_count,
@@ -258,6 +259,8 @@ def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> Mamb
     if slots is None:
         return spec
     validate_tree_state_slots(slots, spec.mamba_type)
+    if getattr(vllm_config.cache_config, "use_replayssm", False) and _uses_gdn_recoverssm(vllm_config):
+        raise NotImplementedError("Qwen GDN RecoverSSM is not yet wired into MRV2 tree speculative decoding.")
     num_spec = vllm_config.speculative_config.num_speculative_tokens
     if slots > spec.num_speculative_blocks + 1:
         spec = replace(spec, num_speculative_blocks=slots - 1)
