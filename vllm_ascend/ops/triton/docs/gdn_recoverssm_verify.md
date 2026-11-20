@@ -49,6 +49,20 @@ tile when its occupancy checks retain at least 96 programs. Verify uses four
 warps and disables FP fusion. Shapes, inner strides, head geometry and activation
 options participate in specialization; variable metadata values remain on device.
 
+### Tree verification
+
+For a packed tree, supply the root-to-node path and its length for each
+packed token. A path includes the current node and uses request-local token
+slots. For example, the row for node 4 can contain `[0, 2, 4]` with length
+3. Each node starts from the read-only checkpoint, recomputes the forward
+recurrence along its path, and writes only its own output and replay record.
+The replay slot equals the request-local token slot, so the selected path
+can be passed directly to [commit](gdn_recoverssm_commit.md).
+
+Ancestor steps are recomputed across descendants. This uses no global buffer
+for intermediate state matrices and requires no synchronization between nodes.
+The total recurrence work is proportional to the sum of path lengths.
+
 ## Parameters
 
 `B` is the number of speculative rows, `T` the flattened token count, `P` the
@@ -65,6 +79,8 @@ counts, and `K/V` the key/value widths.
 | `replay_cache` | Output | Caller-supplied buffer `[P, HV, Q, V + K + 1]`, written for valid pages and tokens | FP32 | Paged ND with explicit strides |
 | `query_start_loc` | Input | Cumulative token offsets `[B + 1]` | INT32 or INT64 | Strided 1D |
 | `state_indices` | Input | Source page IDs `[B]`. Nonpositive IDs select inactive rows | INT32 or INT64 | Strided 1D |
+| `node_path_slots` | Optional input | Request-local token slots, root first and the current node last. Unused entries may be padded with `-1` | INT32 or INT64 | Strided `[T, max_depth]` |
+| `node_path_lengths` | Optional input | Number of active entries in each node path. The caller must supply valid paths of length 1 through `max_depth` | INT32 or INT64 | Strided `[T]` |
 | `spec_query_len` | Attribute | Window capacity `Q` | Python int | Positive scalar |
 | `scale` | Attribute | Query scale. Default `None` selects `K**-0.5` | Python float or `None` | Scalar / N/A |
 | `softplus_beta` | Attribute | Positive softplus beta, default `1.0` | Python float | Scalar |

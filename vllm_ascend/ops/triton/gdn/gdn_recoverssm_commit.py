@@ -46,9 +46,17 @@ def _load_gdn_commit_record(
 
 
 @triton.jit
+def _gdn_commit_record_position(path_ptr, row, path_pos, stride_path_row, stride_path_pos):
+    if path_ptr is None:
+        return path_pos
+    return tl.load(path_ptr + row * stride_path_row + path_pos * stride_path_pos).to(tl.int64)
+
+
+@triton.jit
 def _accumulate_gdn_commit_step(
     replay_ptr,
     token_record_pos,
+    path_pos,
     offs_k,
     offs_v,
     mask_k,
@@ -80,7 +88,7 @@ def _accumulate_gdn_commit_step(
     final_decay *= decay
     if ALIGN_MODE:
         # A scalar branch skips the FMA; tl.where evaluates both operands.
-        if need_boundary & (token_record_pos < boundary_recovery_len):
+        if need_boundary & (path_pos < boundary_recovery_len):
             boundary_k = normalized_k * boundary_decay
             boundary_correction = tl.fma(correction[:, None], boundary_k[None, :], boundary_correction)
             boundary_decay *= decay
@@ -100,6 +108,7 @@ def _commit_gdn_state_kernel(
     final_state_indices_ptr,
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
+    path_ptr,
     null_block_id,
     stride_state_head,
     stride_state_v,
@@ -108,6 +117,8 @@ def _commit_gdn_state_kernel(
     stride_replay_pos,
     stride_replay_dim,
     stride_state_indices,
+    stride_path_row,
+    stride_path_pos,
     num_layers,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -180,9 +191,11 @@ def _commit_gdn_state_kernel(
     if UNROLL_COMMIT:
         for token_offset in tl.static_range(SPEC_QUERY_LEN):
             if token_offset < commit_len:
+                path_pos = commit_len - token_offset - 1
                 final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_gdn_commit_step(
                     replay_ptr,
-                    commit_len - token_offset - 1,
+                    _gdn_commit_record_position(path_ptr, pid_b, path_pos, stride_path_row, stride_path_pos),
+                    path_pos,
                     offs_k,
                     offs_v,
                     mask_k,
@@ -202,9 +215,11 @@ def _commit_gdn_state_kernel(
     else:
         for token_offset in range(tl.minimum(commit_len, SPEC_QUERY_LEN)):
             if token_offset < commit_len:
+                path_pos = commit_len - token_offset - 1
                 final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_gdn_commit_step(
                     replay_ptr,
-                    commit_len - token_offset - 1,
+                    _gdn_commit_record_position(path_ptr, pid_b, path_pos, stride_path_row, stride_path_pos),
+                    path_pos,
                     offs_k,
                     offs_v,
                     mask_k,
@@ -258,6 +273,7 @@ def _commit_gdn_state_grouped_kernel(
     final_state_indices_ptr,
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
+    path_ptr,
     null_block_id,
     stride_state_head,
     stride_state_v,
@@ -266,6 +282,8 @@ def _commit_gdn_state_grouped_kernel(
     stride_replay_pos,
     stride_replay_dim,
     stride_state_indices,
+    stride_path_row,
+    stride_path_pos,
     num_layers,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -345,8 +363,8 @@ def _commit_gdn_state_grouped_kernel(
         boundary_correction = tl.zeros([BH, BV, BK], tl.float32)
     for token_offset in tl.static_range(SPEC_QUERY_LEN):
         if token_offset < commit_len:
-            # Reverse token access order from commit_len.
-            token_record_pos = commit_len - token_offset - 1
+            path_pos = commit_len - token_offset - 1
+            token_record_pos = _gdn_commit_record_position(path_ptr, pid_b, path_pos, stride_path_row, stride_path_pos)
             record_ptr = replay_ptr + token_record_pos * stride_replay_pos
             correction, normalized_k, decay = _load_gdn_commit_record(
                 record_ptr=record_ptr[:, None],
@@ -364,7 +382,7 @@ def _commit_gdn_state_grouped_kernel(
             if ALIGN_MODE:
                 # Non-crossing requests can still have a positive boundary length.
                 # Check the destination as well, and skip unused matrix updates.
-                if need_boundary & (token_record_pos < boundary_recovery_len):
+                if need_boundary & (path_pos < boundary_recovery_len):
                     boundary_k = normalized_k * boundary_decay
                     boundary_correction = tl.fma(correction[:, :, None], boundary_k[:, None, :], boundary_correction)
                     boundary_decay *= decay
@@ -403,9 +421,28 @@ def gdn_recoverssm_commit(
     *,
     spec_query_len: int,
     align_mode: bool,
+    path_record_indices: torch.Tensor | None = None,
 ) -> None:
-    """Reconstruct accepted checkpoints using a prepared commit plan."""
+    """Reconstruct accepted checkpoints using a prepared commit plan.
+
+    If supplied, the first commit_lens[row] entries of path_record_indices[row]
+    select replay slots on that row's source page, in forward execution order.
+    Include the leading target step if it was verified from the checkpoint.
+    The caller owns path validity and must supply in-range replay slot indices.
+    Otherwise, each row commits the contiguous prefix starting at slot zero.
+    """
     batch = state_indices.numel()
+    stride_path_row = stride_path_pos = 0
+    if path_record_indices is not None:
+        if (
+            path_record_indices.ndim != 2
+            or path_record_indices.shape[0] != batch
+            or path_record_indices.shape[1] < spec_query_len
+            or path_record_indices.dtype not in (torch.int32, torch.int64)
+            or path_record_indices.device != replay.device
+        ):
+            raise ValueError("Expected an integer replay path per commit row on the replay device.")
+        stride_path_row, stride_path_pos = path_record_indices.stride()
     num_layers = state_commit_cache_address_stride_table.shape[2]
     _, hv, dv, dk = state.shape
     block_k = triton.next_power_of_2(dk)
@@ -452,6 +489,7 @@ def gdn_recoverssm_commit(
         final_state_indices_ptr=final_state_indices,
         boundary_state_indices_ptr=boundary_state_indices,
         boundary_recovery_lens_ptr=boundary_recovery_lens,
+        path_ptr=path_record_indices,
         null_block_id=0,
         stride_state_head=state.stride(1),
         stride_state_v=state.stride(2),
@@ -460,6 +498,8 @@ def gdn_recoverssm_commit(
         stride_replay_pos=replay.stride(2),
         stride_replay_dim=replay.stride(3),
         stride_state_indices=state_indices.stride(0),
+        stride_path_row=stride_path_row,
+        stride_path_pos=stride_path_pos,
         num_layers=num_layers,
         K=dk,
         V=dv,

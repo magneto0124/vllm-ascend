@@ -25,6 +25,8 @@ def _gdn_recoverssm_verify_kernel(
     replay_ptr,
     query_start_loc_ptr,
     state_indices_ptr,
+    node_path_slots_ptr,
+    node_path_lengths_ptr,
     out_ptr,
     null_block_id,
     scale,
@@ -46,6 +48,10 @@ def _gdn_recoverssm_verify_kernel(
     stride_out_head: tl.constexpr,
     stride_query_start_loc: tl.constexpr,
     stride_state_indices: tl.constexpr,
+    stride_path_token: tl.constexpr,
+    stride_path_step: tl.constexpr,
+    stride_path_length: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
     NUM_KEY_HEADS: tl.constexpr,
     NUM_VALUE_HEADS: tl.constexpr,
     K: tl.constexpr,
@@ -69,12 +75,19 @@ def _gdn_recoverssm_verify_kernel(
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(2)
     pid_h = tl.program_id(1)
+    node_slot = 0
+    if node_path_slots_ptr is not None:
+        node_slot = pid_b % SPEC_QUERY_LEN
+        pid_b = pid_b // SPEC_QUERY_LEN
 
     bos = tl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(tl.int64)
     eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(tl.int64)
     if bos == eos:
         return
     query_len = eos - bos
+    if node_path_slots_ptr is not None:
+        if node_slot >= query_len:
+            return
     state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
 
     offs_k = tl.arange(0, BK)
@@ -99,8 +112,15 @@ def _gdn_recoverssm_verify_kernel(
         mask_state = (offs_v < V)[:, None] & (offs_k < K)[None, :]
 
     if state_idx <= null_block_id:
-        for token_offset in range(query_len):
-            tl.store(out_ptr + (bos + token_offset) * stride_out_token + pid_h * stride_out_head + offs_v, 0.0, mask_v)
+        if node_path_slots_ptr is not None:
+            tl.store(out_ptr + (bos + node_slot) * stride_out_token + pid_h * stride_out_head + offs_v, 0.0, mask_v)
+        else:
+            for token_offset in range(query_len):
+                tl.store(
+                    out_ptr + (bos + token_offset) * stride_out_token + pid_h * stride_out_head + offs_v,
+                    0.0,
+                    mask_v,
+                )
         return
 
     state_ptrs = (
@@ -118,18 +138,29 @@ def _gdn_recoverssm_verify_kernel(
     q_start = q_ptr + bos * stride_q_token + key_head * stride_q_head + offs_k
     k_start = k_ptr + bos * stride_k_token + key_head * stride_k_head + offs_k
     qk_other = 0.0 if mask_k is not None else None
-    next_q = tl.load(q_start, mask_k, qk_other)
-    next_k = tl.load(k_start, mask_k, qk_other)
-    for token_offset in range(query_len):
-        token = bos + token_offset
+    steps = query_len
+    next_slot = tl.full((), 0, tl.int64)
+    if node_path_slots_ptr is not None:
+        # Each node independently replays its ancestors from the checkpoint.
+        # This keeps state in registers and needs no cross-program ordering.
+        path_row = node_path_slots_ptr + (bos + node_slot) * stride_path_token
+        steps = tl.load(node_path_lengths_ptr + (bos + node_slot) * stride_path_length).to(tl.int64)
+        next_slot = tl.load(path_row, mask=steps > 0, other=0).to(tl.int64)
+    next_q = tl.load(q_start + next_slot * stride_q_token, mask_k, qk_other)
+    next_k = tl.load(k_start + next_slot * stride_k_token, mask_k, qk_other)
+    for path_step in range(steps):
+        token = bos + next_slot
         q = next_q.to(tl.float32)
         k = next_k.to(tl.float32)
         # Load the next Q/K before the current state update so the backend
         # can overlap them. Keep the prefetched values in the input dtype.
-        next_offset = token_offset + 1
-        if next_offset < query_len:
-            next_q = tl.load(q_start + next_offset * stride_q_token, mask_k, qk_other)
-            next_k = tl.load(k_start + next_offset * stride_k_token, mask_k, qk_other)
+        next_step = path_step + 1
+        if next_step < steps:
+            next_slot = next_step.to(tl.int64)
+            if node_path_slots_ptr is not None:
+                next_slot = tl.load(path_row + next_step * stride_path_step).to(tl.int64)
+            next_q = tl.load(q_start + next_slot * stride_q_token, mask_k, qk_other)
+            next_k = tl.load(k_start + next_slot * stride_k_token, mask_k, qk_other)
         v = tl.load(
             v_ptr + token * stride_v_token + pid_h * stride_v_head + offs_v,
             mask_v,
@@ -156,19 +187,24 @@ def _gdn_recoverssm_verify_kernel(
         correction = (v - tl.sum(decayed_state * normalized_k[None, :], axis=1)) * beta
         # GDN output consumes the updated state, including for the last token.
         state = decayed_state + correction[:, None] * normalized_k[None, :]
-        out = tl.sum(state * q[None, :], axis=1)
-        tl.store(out_ptr + token * stride_out_token + pid_h * stride_out_head + offs_v, out, mask_v)
-
-        record_ptr = (
-            replay_ptr
-            + state_idx * stride_replay_block
-            + pid_h * stride_replay_head
-            + token_offset * stride_replay_position
-        )
-        tl.store(record_ptr + offs_v * stride_replay_dim, correction, mask_v)
-        if pid_v == 0:
-            tl.store(record_ptr + (V + offs_k) * stride_replay_dim, normalized_k, mask_k)
-            tl.store(record_ptr + (V + K) * stride_replay_dim, decay)
+        if (node_path_slots_ptr is None) | (next_step == steps):
+            output_token = token
+            record_slot = path_step
+            if node_path_slots_ptr is not None:
+                output_token = bos + node_slot
+                record_slot = node_slot.to(tl.int64)
+            out = tl.sum(state * q[None, :], axis=1)
+            tl.store(out_ptr + output_token * stride_out_token + pid_h * stride_out_head + offs_v, out, mask_v)
+            record_ptr = (
+                replay_ptr
+                + state_idx * stride_replay_block
+                + pid_h * stride_replay_head
+                + record_slot * stride_replay_position
+            )
+            tl.store(record_ptr + offs_v * stride_replay_dim, correction, mask_v)
+            if pid_v == 0:
+                tl.store(record_ptr + (V + offs_k) * stride_replay_dim, normalized_k, mask_k)
+                tl.store(record_ptr + (V + K) * stride_replay_dim, decay)
 
 
 def validate_gdn_state_replay(checkpoint, replay, hv, dv, dk, spec_query_len):
@@ -203,11 +239,19 @@ def gdn_recoverssm_verify(
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
     out: torch.Tensor | None = None,
+    node_path_slots: torch.Tensor | None = None,
+    node_path_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return GDN outputs and compact records, leaving the checkpoint intact.
 
     Q/K use shape ``[1, T, HK, K]``; V uses ``[1, T, HV, V]``;
     A/B use ``[T, HV]`` or ``[1, T, HV]``.
+
+    In tree mode, each packed token has a row in node_path_slots containing
+    its root-to-node path, including itself, in request-local token slots.
+    node_path_lengths gives the positive number of valid entries in each row.
+    The replay record for a node is written to its request-local token slot.
+    The caller supplies valid active paths and distinct writable replay pages.
     """
     if q.ndim != 4 or q.shape[0] != 1 or k.shape != q.shape:
         raise ValueError("GDN RecoverSSM Q/K must have matching [1,T,HK,K] shapes")
@@ -254,6 +298,22 @@ def gdn_recoverssm_verify(
         raise ValueError("GDN RecoverSSM input exceeds its record capacity")
     if any(t.dtype not in (torch.int32, torch.int64) for t in (state_indices, query_start_loc)):
         raise ValueError("GDN RecoverSSM request metadata must use integer tensors")
+    if (node_path_slots is None) != (node_path_lengths is None):
+        raise ValueError("GDN RecoverSSM tree verification requires both paths and lengths")
+    if node_path_slots is not None:
+        assert node_path_lengths is not None
+        if (
+            node_path_slots.ndim != 2
+            or node_path_slots.shape[0] != tokens
+            or not 1 <= node_path_slots.shape[1] <= spec_query_len
+            or node_path_lengths.shape != (tokens,)
+        ):
+            raise ValueError("GDN RecoverSSM tree path shapes are incompatible")
+        if any(
+            t.device != q.device or t.dtype not in (torch.int32, torch.int64)
+            for t in (node_path_slots, node_path_lengths)
+        ):
+            raise ValueError("GDN RecoverSSM tree metadata must use integer tensors on the input device")
     if scale is None:
         scale = dk**-0.5
     if out is None:
@@ -269,7 +329,8 @@ def gdn_recoverssm_verify(
         is_a5 = is_950()
         if is_a5 and block_v < RECOVERSSM_VALUE_TILE_LARGE and rows * hv >= RECOVERSSM_LARGE_TILE_MIN_PROGRAMS:
             block_v = min(triton.next_power_of_2(dv), RECOVERSSM_VALUE_TILE_LARGE)
-        grid = (triton.cdiv(dv, block_v), hv, rows)
+        tree_mode = node_path_slots is not None
+        grid = (triton.cdiv(dv, block_v), hv, rows * spec_query_len if tree_mode else rows)
         _gdn_recoverssm_verify_kernel[grid](
             # Inputs, persistent checkpoint, and per-token records.
             A_log_ptr=A_log,
@@ -283,6 +344,8 @@ def gdn_recoverssm_verify(
             replay_ptr=replay_cache,
             query_start_loc_ptr=query_start_loc,
             state_indices_ptr=state_indices,
+            node_path_slots_ptr=node_path_slots,
+            node_path_lengths_ptr=node_path_lengths,
             out_ptr=out,
             null_block_id=0,
             scale=scale,
@@ -305,6 +368,10 @@ def gdn_recoverssm_verify(
             stride_out_head=out.stride(2),
             stride_query_start_loc=query_start_loc.stride(0),
             stride_state_indices=state_indices.stride(0),
+            stride_path_token=node_path_slots.stride(0) if node_path_slots is not None else 0,
+            stride_path_step=node_path_slots.stride(1) if node_path_slots is not None else 0,
+            stride_path_length=node_path_lengths.stride(0) if node_path_lengths is not None else 0,
+            SPEC_QUERY_LEN=spec_query_len if tree_mode else 0,
             # Compile-time shape and input-format specialization.
             NUM_KEY_HEADS=hk,
             NUM_VALUE_HEADS=hv,

@@ -23,8 +23,65 @@ from tests.e2e.nightly.single_node.ops.singlecard_ops.triton.gdn_recoverssm_test
     verify,
 )
 from vllm_ascend.ops.triton.gdn import gdn_recoverssm_verify as gdn  # noqa: E402
+from vllm_ascend.ops.triton.gdn.gdn_recoverssm_commit import gdn_recoverssm_commit  # noqa: E402
 
 npu = pytest.fixture(npu_device, name="npu")
+
+
+def test_tree_verify_and_commit_selected_path(npu, record_property):
+    hk, hv, key, value = 2, 4, 7, 5
+    # Two branches share the leading target at slot 2. Rows are packed by
+    # node slot, so root-to-node execution order differs from layout order.
+    paths = ((2, 0), (2, 3, 1), (2,), (2, 3), (2, 0, 4))
+    nodes, depth = len(paths), max(map(len, paths))
+    layer, _ = packed_layer(npu, 3, hk, hv, key, value, nodes, torch.float32, False)
+    _, checkpoint, replay = layer.kv_cache
+    before = checkpoint.clone()
+    inputs = model_inputs(npu, nodes, hk, hv, key, value)
+    a_log, a, b, bias, q, k, v = (tensor.cpu() for tensor in inputs)
+    expected = torch.empty_like(v, dtype=torch.float64)
+    expected_records = torch.empty(hv, nodes, value + key + 1, dtype=torch.float64)
+    expected_states = []
+    accepted_slot = 1
+    for node, path in enumerate(paths):
+        slots = list(path)
+        path_inputs = (a_log, a[slots], b[:, slots], bias, q[:, slots], k[:, slots], v[:, slots])
+        output, history, records = cpu_reference(path_inputs, before, [0, len(path)], [1])
+        expected[:, node] = output[:, -1]
+        expected_records[:, node] = records[1][:, -1]
+        expected_states.append(history[0][-1])
+
+    path_table = torch.tensor(
+        [list(path) + [-1] * (depth - len(path)) for path in paths], dtype=torch.int32, device=npu
+    )
+    lengths = torch.tensor(list(map(len, paths)), dtype=torch.int32, device=npu)
+    offsets = torch.tensor([0, nodes], dtype=torch.int32, device=npu)
+    source = torch.tensor([1], dtype=torch.int32, device=npu)
+    actual = verify(inputs, layer, offsets, source, nodes, node_path_slots=path_table, node_path_lengths=lengths)
+    check_accuracy(actual, expected, record_property, "tree_verify_outputs")
+    check_records(replay, {1: expected_records}, value, record_property, "tree_verify_records")
+    torch.testing.assert_close(checkpoint, before, atol=0, rtol=0)
+
+    addresses = torch.tensor(
+        [[[checkpoint.data_ptr()], [checkpoint.stride(0)]], [[replay.data_ptr()], [replay.stride(0)]]],
+        dtype=torch.int64,
+        device=npu,
+    )
+    unused_boundary = torch.zeros_like(source)
+    gdn_recoverssm_commit(
+        checkpoint,
+        replay,
+        addresses,
+        source,
+        lengths[accepted_slot : accepted_slot + 1],
+        source,
+        unused_boundary,
+        unused_boundary,
+        spec_query_len=depth,
+        align_mode=False,
+        path_record_indices=path_table[accepted_slot : accepted_slot + 1],
+    )
+    check_accuracy(checkpoint[1], expected_states[accepted_slot], record_property, "tree_verify_then_commit")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
