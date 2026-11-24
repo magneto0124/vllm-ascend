@@ -132,6 +132,7 @@ from vllm_ascend.worker.v2.attn_utils import (
 )
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
+from vllm_ascend.worker.v2.spec_decode.tree.preparation_graph import TreePreparationGraphs
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -446,12 +447,18 @@ class NPUModelRunner(GPUModelRunner):
         ):
             tree = self.speculator.tree
             idx = state.input_batch.idx_mapping
-            self.req_states.tree_depths[idx] = tree.depths
-            self.req_states.tree_parents[idx] = tree.parents
-            self.req_states.tree_visibility[idx] = tree.visibility
-            self.req_states.tree_num_nodes[idx] = tree.num_nodes
-            self.req_states.tree_first_child[idx] = tree.first_child
-            self.req_states.tree_next_sibling[idx] = tree.next_sibling
+            names = ("depths", "parents", "visibility", "num_nodes", "first_child", "next_sibling")
+            targets = tuple(getattr(self.req_states, "tree_" + name) for name in names)
+
+            def publish(rows, *values):
+                for target, value in zip(targets, values):
+                    target[rows] = value
+
+            self._run_tree_preparation(
+                ("publish", tuple(t.data_ptr() for t in targets)),
+                publish,
+                (idx, *(getattr(tree, name) for name in names)),
+            )
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
         self._finalize_dump_data()
@@ -955,6 +962,7 @@ class NPUModelRunner(GPUModelRunner):
         mask[num_tokens:].fill_(True)
         return mask
 
+    @torch.profiler.record_function("tree.prepare.runner_inputs")
     def _prepare_inputs_impl(
         self,
         scheduler_output: SchedulerOutput,
@@ -1272,13 +1280,20 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         if tree_depths is not None:
-            input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
-            input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
-            input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
-            input_batch.tree_depths = tree_depths[idx_mapping]
-            input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
-            input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
-            input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
+            names = (
+                "tree_visibility", "tree_num_nodes", "draft_tokens", "tree_depths",
+                "tree_parents", "tree_first_child", "tree_next_sibling",
+            )
+            sources = tuple(getattr(self.req_states, name) for name in names)
+
+            def gather(rows):
+                return tuple(source[rows] for source in sources)
+
+            values = self._run_tree_preparation(
+                ("gather_tree", tuple(t.data_ptr() for t in sources)), gather, (idx_mapping,)
+            )
+            for name, value in zip(names, values):
+                setattr(input_batch, "tree_tokens" if name == "draft_tokens" else name, value)
             input_batch.kv_cache_positions = self.input_buffers.kv_cache_positions[:num_tokens_after_padding]
 
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
@@ -1319,23 +1334,59 @@ class NPUModelRunner(GPUModelRunner):
             slot_mappings = self.block_tables.slot_mappings[:, : input_batch.num_tokens_after_padding]
         return slot_mappings
 
+    def _run_tree_preparation(self, key, operation, inputs):
+        if (
+            inputs[0].device.type != "npu"
+            or self.model_config.enforce_eager
+            or self.vllm_config.scheduler_config.max_num_seqs != 1
+            or self.vllm_config.scheduler_config.async_scheduling
+            or (key[0] == "attention" and key[-1] != self.decode_query_len)
+            or self.compilation_config.cudagraph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
+            or torch.npu.is_current_stream_capturing()
+        ):
+            return operation(*inputs)
+        graphs = getattr(self, "_tree_preparation_graphs", None)
+        if graphs is None:
+            graphs = self._tree_preparation_graphs = TreePreparationGraphs()
+        with torch.profiler.record_function("tree.prepare." + key[0]):
+            return graphs.run(key, operation, inputs)
+
+    @torch.profiler.record_function("tree.prepare.block_tables_and_slots")
     def prepare_attn(self, input_batch):
         """Use unique kv_cache_positions for tree spec KV mapping; RoPE stays on positions."""
         if self.tree_shape is None or input_batch.kv_cache_positions is None:
             return super().prepare_attn(input_batch)
 
-        block_tables = self.block_tables.gather_block_tables(
-            input_batch.idx_mapping,
-            num_reqs_padded=input_batch.num_reqs_after_padding,
-            num_computed_tokens=self.req_states.num_computed_tokens.gpu,
+        # Keep host dirty-row bookkeeping outside capture, including when a
+        # preceding dummy/prefill batch left more rows in the shared buffer.
+        tables = self.block_tables
+        rows = max(input_batch.num_reqs_after_padding, tables._num_dirty_rows)
+        output_rows = input_batch.num_reqs_after_padding
+        tokens = input_batch.num_tokens_after_padding
+
+        def prepare(mapping, starts, positions, computed):
+            blocks = tables.gather_block_tables(
+                mapping,
+                rows,
+                out=tuple(tables.input_block_tables),
+                out_ptrs=tables.input_block_table_ptrs,
+                num_computed_tokens=computed,
+            )
+            slots = tables.compute_slot_mappings(mapping, starts, positions, num_tokens_padded=tokens)
+            return tuple(block[:output_rows] for block in blocks), slots
+
+        result = self._run_tree_preparation(
+            ("attention", id(tables), rows, output_rows, tokens),
+            prepare,
+            (
+                input_batch.idx_mapping,
+                input_batch.query_start_loc,
+                input_batch.kv_cache_positions,
+                self.req_states.num_computed_tokens.gpu,
+            ),
         )
-        slot_mappings = self.block_tables.compute_slot_mappings(
-            input_batch.idx_mapping,
-            input_batch.query_start_loc,
-            input_batch.kv_cache_positions,
-            num_tokens_padded=input_batch.num_tokens_after_padding,
-        )
-        return block_tables, slot_mappings
+        tables._num_dirty_rows = input_batch.idx_mapping.shape[0]
+        return result
 
     def _lmhead_tp_max_num_logits(self) -> int:
         """Logits row capacity every rank agrees on (config-derived:

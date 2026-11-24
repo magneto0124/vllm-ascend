@@ -54,14 +54,28 @@ options participate in specialization; variable metadata values remain on device
 For a packed tree, supply the root-to-node path and its length for each
 packed token. A path includes the current node and uses request-local token
 slots. For example, the row for node 4 can contain `[0, 2, 4]` with length
-3. Each node starts from the read-only checkpoint, recomputes the forward
-recurrence along its path, and writes only its own output and replay record.
+3. Only leaf tasks start from the read-only checkpoint and recompute the
+forward recurrence along their paths. Each node is assigned to its deepest
+descendant leaf (largest local slot breaks ties). That leaf writes the node's
+output and replay record when it reaches the node. This also supports token
+IDs that are not in topological order, without concurrent writes to shared ancestors.
 The replay slot equals the request-local token slot, so the selected path
 can be passed directly to [commit](gdn_recoverssm_commit.md).
 
 Ancestor steps are recomputed across descendants. This uses no global buffer
 for intermediate state matrices and requires no synchronization between nodes.
-The total recurrence work is proportional to the sum of path lengths.
+The total recurrence work is proportional to the sum of **leaf** path lengths.
+The tree grid remains `(ceil(V / BV), HV, B * Q)` for graph compatibility;
+non-leaf programs exit before loading checkpoint matrices. No CPU leaf count,
+per-depth launch loop, or full intermediate-state workspace is required.
+
+`build_tree_leaf_owners` computes the ownership table from valid path rows.
+Production builds it once with shared tree metadata and stages it into stable
+buffers for target graph replay. Standalone verify calls can omit the table;
+the wrapper then constructs it. Ownership preparation specializes on capacity,
+path width, and strides, not tree contents. This change has no measured NPU
+performance result yet; fewer recurrence steps do not guarantee proportional
+speedup because a small leaf count also reduces active parallelism.
 
 ## Parameters
 
@@ -81,6 +95,7 @@ counts, and `K/V` the key/value widths.
 | `state_indices` | Input | Source page IDs `[B]`. Nonpositive IDs select inactive rows | INT32 or INT64 | Strided 1D |
 | `node_path_slots` | Optional input | Request-local token slots, root first and the current node last. Unused entries may be padded with `-1` | INT32 or INT64 | Strided `[T, max_depth]` |
 | `node_path_lengths` | Optional input | Number of active entries in each node path. The caller must supply valid paths of length 1 through `max_depth` | INT32 or INT64 | Strided `[T]` |
+| `node_leaf_owners` | Optional input | Local descendant leaf slot responsible for each node; built automatically if omitted in tree mode | INT32 or INT64 | Strided `[T]` |
 | `spec_query_len` | Attribute | Window capacity `Q` | Python int | Positive scalar |
 | `scale` | Attribute | Query scale. Default `None` selects `K**-0.5` | Python float or `None` | Scalar / N/A |
 | `softplus_beta` | Attribute | Positive softplus beta, default `1.0` | Python float | Scalar |

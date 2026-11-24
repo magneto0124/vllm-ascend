@@ -28,11 +28,18 @@ from vllm_ascend.ops.triton.gdn.gdn_recoverssm_commit import gdn_recoverssm_comm
 npu = pytest.fixture(npu_device, name="npu")
 
 
-def test_tree_verify_and_commit_selected_path(npu, record_property):
+@pytest.mark.parametrize("paths", [
+    ((0,),),
+    ((0,), (0, 1), (0, 1, 2), (0, 1, 2, 3)),
+    ((0,), (0, 1), (0, 2), (0, 3)),
+    ((2, 0), (2, 3, 1), (2,), (2, 3), (2, 0, 4)),
+    ((0,), (0, 1), (0, 1, 2), (0, 3), (0, 1, 2, 4)),
+], ids=["root", "chain", "star", "unordered_branches", "unequal_depths"])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_tree_verify_and_commit_selected_path(npu, record_property, paths, graph_mode):
     hk, hv, key, value = 2, 4, 7, 5
     # Two branches share the leading target at slot 2. Rows are packed by
     # node slot, so root-to-node execution order differs from layout order.
-    paths = ((2, 0), (2, 3, 1), (2,), (2, 3), (2, 0, 4))
     nodes, depth = len(paths), max(map(len, paths))
     layer, _ = packed_layer(npu, 3, hk, hv, key, value, nodes, torch.float32, False)
     _, checkpoint, replay = layer.kv_cache
@@ -42,7 +49,7 @@ def test_tree_verify_and_commit_selected_path(npu, record_property):
     expected = torch.empty_like(v, dtype=torch.float64)
     expected_records = torch.empty(hv, nodes, value + key + 1, dtype=torch.float64)
     expected_states = []
-    accepted_slot = 1
+    accepted_slot = min(1, nodes - 1)
     for node, path in enumerate(paths):
         slots = list(path)
         path_inputs = (a_log, a[slots], b[:, slots], bias, q[:, slots], k[:, slots], v[:, slots])
@@ -57,8 +64,35 @@ def test_tree_verify_and_commit_selected_path(npu, record_property):
     lengths = torch.tensor(list(map(len, paths)), dtype=torch.int32, device=npu)
     offsets = torch.tensor([0, nodes], dtype=torch.int32, device=npu)
     source = torch.tensor([1], dtype=torch.int32, device=npu)
-    actual = verify(inputs, layer, offsets, source, nodes, node_path_slots=path_table, node_path_lengths=lengths)
+    owners = gdn.build_tree_leaf_owners(path_table, lengths, offsets, nodes)
+    expected_owners = [
+        max((i for i, path in enumerate(paths) if node in path), key=lambda i: (len(paths[i]), i))
+        for node in range(nodes)
+    ]
+    assert owners.cpu().tolist() == expected_owners
+    # Every node is written by exactly one terminal task on a path containing it.
+    leaves = {owner for owner in expected_owners}
+    assert all(expected_owners[leaf] == leaf for leaf in leaves)
+    assert sum(len(paths[leaf]) for leaf in leaves) <= sum(map(len, paths))
+
+    def launch():
+        return verify(
+            inputs, layer, offsets, source, nodes, node_path_slots=path_table,
+            node_path_lengths=lengths, node_leaf_owners=owners,
+        )
+
+    actual = launch()
+    if graph_mode:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual = launch()
+        graph.replay()
     check_accuracy(actual, expected, record_property, "tree_verify_outputs")
+    if not graph_mode:
+        automatic = verify(
+            inputs, layer, offsets, source, nodes, node_path_slots=path_table, node_path_lengths=lengths
+        )
+        torch.testing.assert_close(automatic, actual, rtol=0, atol=0)
     check_records(replay, {1: expected_records}, value, record_property, "tree_verify_records")
     torch.testing.assert_close(checkpoint, before, atol=0, rtol=0)
 
@@ -82,6 +116,14 @@ def test_tree_verify_and_commit_selected_path(npu, record_property):
         path_record_indices=path_table[accepted_slot : accepted_slot + 1],
     )
     check_accuracy(checkpoint[1], expected_states[accepted_slot], record_property, "tree_verify_then_commit")
+
+
+def test_leaf_owners_packed_rows_and_empty_request(npu):
+    paths = torch.tensor([[0, -1], [0, 1], [0, -1]], dtype=torch.int32, device=npu)
+    lengths = torch.tensor([1, 2, 1], dtype=torch.int32, device=npu)
+    offsets = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device=npu)
+    owners = gdn.build_tree_leaf_owners(paths, lengths, offsets, 3)
+    assert owners.cpu().tolist() == [1, 1, 0]
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

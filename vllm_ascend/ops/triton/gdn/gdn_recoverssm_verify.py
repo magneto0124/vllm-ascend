@@ -13,6 +13,47 @@ RECOVERSSM_LARGE_TILE_MIN_PROGRAMS = 96
 
 
 @triton.jit
+def _tree_leaf_owner_kernel(
+    paths, lengths, starts, owners,
+    PS: tl.constexpr, PT: tl.constexpr, LS: tl.constexpr, QS: tl.constexpr,
+    N: tl.constexpr, D: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+):
+    row = tl.program_id(0)
+    node = tl.program_id(1)
+    bos = tl.load(starts + row * QS)
+    count = tl.load(starts + (row + 1) * QS) - bos
+    if node >= count:
+        return
+    candidates = tl.arange(0, BN)
+    columns = tl.arange(0, BD)
+    depth = tl.load(lengths + (bos + candidates) * LS, candidates < count, 0)
+    path = tl.load(
+        paths + (bos + candidates[:, None]) * PS + columns[None, :] * PT,
+        (candidates[:, None] < count) & (columns[None, :] < D) & (columns[None, :] < depth[:, None]),
+        -1,
+    )
+    contains = tl.sum((path == node).to(tl.int32), axis=1) > 0
+    # A deepest descendant is a leaf, even when token IDs are not topological.
+    score = tl.where(contains & (candidates < count), depth * (N + 1) + candidates, -1)
+    best = tl.max(score, axis=0)
+    tl.store(owners + bos + node, tl.where(best >= 0, best % (N + 1), -1))
+
+
+def build_tree_leaf_owners(paths, lengths, query_start_loc, spec_query_len):
+    """Assign each node to one deepest descendant leaf; no device-to-host read."""
+    owners = torch.full_like(lengths, -1, memory_format=torch.contiguous_format)
+    rows = query_start_loc.numel() - 1
+    if rows and paths.shape[0]:
+        _tree_leaf_owner_kernel[(rows, spec_query_len)](
+            paths, lengths, query_start_loc, owners,
+            PS=paths.stride(0), PT=paths.stride(1), LS=lengths.stride(0), QS=query_start_loc.stride(0),
+            N=spec_query_len, D=paths.shape[1], BN=triton.next_power_of_2(spec_query_len),
+            BD=triton.next_power_of_2(paths.shape[1]),
+        )
+    return owners
+
+
+@triton.jit
 def _gdn_recoverssm_verify_kernel(
     A_log_ptr,
     a_ptr,
@@ -27,6 +68,7 @@ def _gdn_recoverssm_verify_kernel(
     state_indices_ptr,
     node_path_slots_ptr,
     node_path_lengths_ptr,
+    node_leaf_owners_ptr,
     out_ptr,
     null_block_id,
     scale,
@@ -51,6 +93,7 @@ def _gdn_recoverssm_verify_kernel(
     stride_path_token: tl.constexpr,
     stride_path_step: tl.constexpr,
     stride_path_length: tl.constexpr,
+    stride_leaf_owner: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     NUM_KEY_HEADS: tl.constexpr,
     NUM_VALUE_HEADS: tl.constexpr,
@@ -123,6 +166,12 @@ def _gdn_recoverssm_verify_kernel(
                 )
         return
 
+    if node_path_slots_ptr is not None:
+        # Non-leaves have a descendant owner. Only leaves replay a path.
+        owner = tl.load(node_leaf_owners_ptr + (bos + node_slot) * stride_leaf_owner)
+        if owner != node_slot:
+            return
+
     state_ptrs = (
         state_ptr
         + state_idx * stride_state_block
@@ -141,25 +190,29 @@ def _gdn_recoverssm_verify_kernel(
     steps = query_len
     next_slot = tl.full((), 0, tl.int64)
     if node_path_slots_ptr is not None:
-        # Each node independently replays its ancestors from the checkpoint.
+        # Each leaf independently replays its ancestors from the checkpoint.
         # This keeps state in registers and needs no cross-program ordering.
         path_row = node_path_slots_ptr + (bos + node_slot) * stride_path_token
         steps = tl.load(node_path_lengths_ptr + (bos + node_slot) * stride_path_length).to(tl.int64)
         next_slot = tl.load(path_row, mask=steps > 0, other=0).to(tl.int64)
-    next_q = tl.load(q_start + next_slot * stride_q_token, mask_k, qk_other)
+    if node_path_slots_ptr is None:
+        next_q = tl.load(q_start + next_slot * stride_q_token, mask_k, qk_other)
     next_k = tl.load(k_start + next_slot * stride_k_token, mask_k, qk_other)
     for path_step in range(steps):
+        current_slot = next_slot
         token = bos + next_slot
-        q = next_q.to(tl.float32)
+        if node_path_slots_ptr is None:
+            q = next_q.to(tl.float32)
         k = next_k.to(tl.float32)
-        # Load the next Q/K before the current state update so the backend
-        # can overlap them. Keep the prefetched values in the input dtype.
+        # Prefetch K for both modes and Q for the linear mode. Tree Q is
+        # loaded only when this leaf owns the current node's output.
         next_step = path_step + 1
         if next_step < steps:
             next_slot = next_step.to(tl.int64)
             if node_path_slots_ptr is not None:
                 next_slot = tl.load(path_row + next_step * stride_path_step).to(tl.int64)
-            next_q = tl.load(q_start + next_slot * stride_q_token, mask_k, qk_other)
+            if node_path_slots_ptr is None:
+                next_q = tl.load(q_start + next_slot * stride_q_token, mask_k, qk_other)
             next_k = tl.load(k_start + next_slot * stride_k_token, mask_k, qk_other)
         v = tl.load(
             v_ptr + token * stride_v_token + pid_h * stride_v_head + offs_v,
@@ -175,9 +228,11 @@ def _gdn_recoverssm_verify_kernel(
         gdn_gate = neg_A * softplus_x
         beta = tl.sigmoid(tl.load(b_ptr + token * stride_b_token + pid_h * stride_b_head).to(tl.float32))
         if USE_QK_L2NORM:
-            q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6)
+            if node_path_slots_ptr is None:
+                q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6)
             k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
-        q = q * scale
+        if node_path_slots_ptr is None:
+            q = q * scale
 
         # Store the same FP32 decay that is multiplied into the state.
         decay = tl.exp(gdn_gate)
@@ -187,12 +242,20 @@ def _gdn_recoverssm_verify_kernel(
         correction = (v - tl.sum(decayed_state * normalized_k[None, :], axis=1)) * beta
         # GDN output consumes the updated state, including for the last token.
         state = decayed_state + correction[:, None] * normalized_k[None, :]
-        if (node_path_slots_ptr is None) | (next_step == steps):
+        write_node = True
+        if node_path_slots_ptr is not None:
+            write_node = tl.load(node_leaf_owners_ptr + token * stride_leaf_owner) == node_slot
+        if write_node:
             output_token = token
             record_slot = path_step
             if node_path_slots_ptr is not None:
-                output_token = bos + node_slot
-                record_slot = node_slot.to(tl.int64)
+                output_token = token
+                record_slot = current_slot.to(tl.int64)
+                # Exactly one leaf owns each ancestor's output and record.
+                q = tl.load(q_start + current_slot * stride_q_token, mask_k, qk_other).to(tl.float32)
+                if USE_QK_L2NORM:
+                    q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6)
+                q = q * scale
             out = tl.sum(state * q[None, :], axis=1)
             tl.store(out_ptr + output_token * stride_out_token + pid_h * stride_out_head + offs_v, out, mask_v)
             record_ptr = (
@@ -241,6 +304,7 @@ def gdn_recoverssm_verify(
     out: torch.Tensor | None = None,
     node_path_slots: torch.Tensor | None = None,
     node_path_lengths: torch.Tensor | None = None,
+    node_leaf_owners: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return GDN outputs and compact records, leaving the checkpoint intact.
 
@@ -252,6 +316,9 @@ def gdn_recoverssm_verify(
     node_path_lengths gives the positive number of valid entries in each row.
     The replay record for a node is written to its request-local token slot.
     The caller supplies valid active paths and distinct writable replay pages.
+    Only leaves replay paths. node_leaf_owners assigns every node to one
+    descendant leaf responsible for its output/record; omitted owners are
+    computed by the wrapper. Production metadata shares owners across layers.
     """
     if q.ndim != 4 or q.shape[0] != 1 or k.shape != q.shape:
         raise ValueError("GDN RecoverSSM Q/K must have matching [1,T,HK,K] shapes")
@@ -330,6 +397,17 @@ def gdn_recoverssm_verify(
         if is_a5 and block_v < RECOVERSSM_VALUE_TILE_LARGE and rows * hv >= RECOVERSSM_LARGE_TILE_MIN_PROGRAMS:
             block_v = min(triton.next_power_of_2(dv), RECOVERSSM_VALUE_TILE_LARGE)
         tree_mode = node_path_slots is not None
+        if tree_mode and node_leaf_owners is None:
+            node_leaf_owners = build_tree_leaf_owners(
+                node_path_slots, node_path_lengths, query_start_loc, spec_query_len
+            )
+        if node_leaf_owners is not None and (
+            not tree_mode
+            or node_leaf_owners.shape != (tokens,)
+            or node_leaf_owners.device != q.device
+            or node_leaf_owners.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("GDN RecoverSSM leaf owners must be integer token indices on the input device")
         grid = (triton.cdiv(dv, block_v), hv, rows * spec_query_len if tree_mode else rows)
         _gdn_recoverssm_verify_kernel[grid](
             # Inputs, persistent checkpoint, and per-token records.
@@ -346,6 +424,7 @@ def gdn_recoverssm_verify(
             state_indices_ptr=state_indices,
             node_path_slots_ptr=node_path_slots,
             node_path_lengths_ptr=node_path_lengths,
+            node_leaf_owners_ptr=node_leaf_owners,
             out_ptr=out,
             null_block_id=0,
             scale=scale,
@@ -371,6 +450,7 @@ def gdn_recoverssm_verify(
             stride_path_token=node_path_slots.stride(0) if node_path_slots is not None else 0,
             stride_path_step=node_path_slots.stride(1) if node_path_slots is not None else 0,
             stride_path_length=node_path_lengths.stride(0) if node_path_lengths is not None else 0,
+            stride_leaf_owner=node_leaf_owners.stride(0) if node_leaf_owners is not None else 0,
             SPEC_QUERY_LEN=spec_query_len if tree_mode else 0,
             # Compile-time shape and input-format specialization.
             NUM_KEY_HEADS=hk,

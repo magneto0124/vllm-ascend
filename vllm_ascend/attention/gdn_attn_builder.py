@@ -476,6 +476,7 @@ def _split_gdn_batch(
 
 
 class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+    _TREE_RECOVERSSM = False
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     build_device_chunk_metadata = True
 
@@ -584,9 +585,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if mamba_type is not None:
             validate_tree_state_slots(slots, mamba_type)
         self.spec_tree_slots = slots
-        self.spec_init_state_indices = torch.empty(
-            (self.decode_cudagraph_max_bs, slots), dtype=torch.int32, device=device
-        )
+        if not self._TREE_RECOVERSSM:
+            self.spec_init_state_indices = torch.empty(
+                (self.decode_cudagraph_max_bs, slots), dtype=torch.int32, device=device
+            )
         # ``attn_utils.get_kv_cache_spec`` widens the conv-state shape from the
         # linear-chain ``num_spec`` state columns to the tree's ``slots`` ones as
         # soon as the tree is wider than the chain, so the kernel width has to be
@@ -607,7 +609,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # The tree is exactly as wide as the draft chain, so the buffers the
             # upstream constructor allocated already carry its width. The verify
             # may still outgrow one op call, hence the chunk buffers first.
-            self._allocate_tree_verify_plan_buffers(device, slots)
+            if not self._TREE_RECOVERSSM:
+                self._allocate_tree_verify_plan_buffers(device, slots)
             return
 
         self.num_spec = slots - 1
@@ -629,7 +632,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # tree verification always runs the root plus every node.
             self.reorder_batch_threshold = slots
 
-        self._allocate_tree_verify_plan_buffers(device, slots)
+        if not self._TREE_RECOVERSSM:
+            self._allocate_tree_verify_plan_buffers(device, slots)
 
     def _allocate_tree_verify_plan_buffers(self, device: torch.device, slots: int) -> None:
         """Allocate stable indexed-plan tensors for wide-tree graph replay.
@@ -756,6 +760,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         the chain width here silently aliases tree nodes and corrupts the
         recurrent state after the first branch.
         """
+        if self._TREE_RECOVERSSM:
+            return torch.index_select(block_table_tensor[:, :1], 0, spec_sequence_indices)
         if self.spec_tree_slots is None:
             return torch.index_select(
                 block_table_tensor[:, : self.num_spec + 1],
@@ -958,7 +964,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # The indexed plan reads packed state tables. Tree packing runs when
         # the convolution has tree rows. Padding has query length zero.
         verify_plan = None
-        if conv_window_rows is not None:
+        if conv_window_rows is not None and not self._TREE_RECOVERSSM:
             verify_plan = self._build_tree_verify_plan(
                 actual_seq_lengths[1:],
                 attn_metadata.spec_state_indices_tensor[:spec_num_rows],
@@ -1448,19 +1454,21 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                         or int(spec_row_widths[0]) != shared_gdn_tree.slots
                     ):
                         raise ValueError("shared GDN tree metadata requires one complete speculative tree row")
-                    spec_init_state_indices = shared_gdn_tree.bind_init_state_indices(spec_state_indices_tensor)
+                    if not self._TREE_RECOVERSSM:
+                        spec_init_state_indices = shared_gdn_tree.bind_init_state_indices(spec_state_indices_tensor)
                     spec_conv_window_rows = shared_gdn_tree.conv_window_rows
                     spec_conv_prefix_src = shared_gdn_tree.conv_prefix_src
                 else:
-                    spec_init_state_indices = self._build_tree_init_state_indices(
-                        spec_state_indices_tensor,
-                        num_accepted_tokens,
-                        query_lens_cpu,
-                        spec_sequence_masks_cpu,
-                        tree_parents,
-                        tree_num_nodes,
-                        spec_sequence_indices,
-                    )
+                    if not self._TREE_RECOVERSSM:
+                        spec_init_state_indices = self._build_tree_init_state_indices(
+                            spec_state_indices_tensor,
+                            num_accepted_tokens,
+                            query_lens_cpu,
+                            spec_sequence_masks_cpu,
+                            tree_parents,
+                            tree_num_nodes,
+                            spec_sequence_indices,
+                        )
                     spec_conv_window_rows, spec_conv_prefix_src = self._build_tree_conv_rows(
                         num_accepted_tokens,
                         tree_parents,
@@ -1602,6 +1610,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             if spec_conv_window_rows is not None:
                 assert spec_conv_prefix_src is not None
                 assert self.spec_conv_window_rows is not None and self.spec_conv_prefix_src is not None
+                if self._TREE_RECOVERSSM and graph_request_count > num_spec_decodes:
+                    # Window indices address [request history, packed tokens].
+                    # The graph reserves history for inactive requests too.
+                    history_width = spec_conv_prefix_src.size(1)
+                    spec_conv_window_rows = torch.where(
+                        spec_conv_window_rows >= num_spec_decodes * history_width,
+                        spec_conv_window_rows + (graph_request_count - num_spec_decodes) * history_width,
+                        spec_conv_window_rows,
+                    )
+                    self.spec_conv_prefix_src[num_spec_decodes:graph_request_count].zero_()
                 self.spec_conv_window_rows[: spec_conv_window_rows.size(0)].copy_(
                     spec_conv_window_rows, non_blocking=True
                 )
@@ -1646,6 +1664,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         prev_path_node_ids = torch.zeros_like(tree_parents)
         prev_num_sampled = torch.zeros((m.num_reqs,), dtype=torch.int32, device=device)
         num_accepted_tokens = torch.diff(m.query_start_loc)
+        if self._TREE_RECOVERSSM:
+            # Use a shallow dummy topology even when budget exceeds draft depth.
+            tree_num_nodes = (num_accepted_tokens - 1).to(torch.int32)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
         return self.build(
             0,

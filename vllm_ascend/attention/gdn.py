@@ -575,6 +575,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         has_spec_decode = attn_metadata.num_spec_decodes > 0
+        tree_recovery_graph = getattr(attn_metadata, "tree_full_graph", False)
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
@@ -880,7 +881,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 replay_cache=self_kv_cache[2],
                 query_start_loc=spec_causal_conv1d_meta.query_start_loc,
                 state_indices=spec_state_indices_tensor[:, 0],
-                spec_query_len=self.num_spec + 1,
+                spec_query_len=self_kv_cache[2].shape[2],
+                node_path_slots=attn_metadata.node_path_slots,
+                node_path_lengths=attn_metadata.node_path_lengths,
+                node_leaf_owners=attn_metadata.node_leaf_owners,
+                out=torch.zeros_like(value_spec, memory_format=torch.contiguous_format) if tree_recovery_graph else None,
             )
         elif has_spec_decode:
             if not tree_qkv_prepared:

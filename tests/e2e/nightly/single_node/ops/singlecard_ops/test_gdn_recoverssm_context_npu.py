@@ -43,6 +43,47 @@ def mocked_commit(monkeypatch):
     return context, launches
 
 
+def test_tree_group_graph_refreshes_shared_inputs_and_group_pages(npu):
+    """Exercise real graph replay with lightweight stand-ins for state writes."""
+    contexts = [
+        gdn_context.GDNRecoverSSMCommitContext.__new__(gdn_context.GDNRecoverSSMCommitContext)
+        for _ in range(2)
+    ]
+    outputs = [torch.zeros((2, 5), dtype=torch.int32, device=npu) for _ in contexts]
+
+    def bind_output(output):
+        def commit(lengths, pages, starts, *, commit_conv, path_record_indices):
+            output[:, 0].copy_(lengths)
+            output[:, 1].copy_(pages)
+            output[:, 2:].copy_(path_record_indices)
+
+        return commit
+
+    for context, output in zip(contexts, outputs):
+        context._tree_commit_graphs = {}
+        context.commit = bind_output(output)
+    path = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device=npu)
+    mapping = torch.tensor([0, -1], dtype=torch.int32, device=npu)
+    lengths = torch.tensor([3, 2], dtype=torch.int32, device=npu)
+    starts = torch.tensor([0, 3, 6], dtype=torch.int32, device=npu)
+    pages = [torch.tensor(values, dtype=torch.int32, device=npu) for values in ([2, 3], [7, 9])]
+    rows = torch.tensor([1, 0], dtype=torch.int64, device=npu)
+    groups = ((contexts[0], pages[0], starts, None), (contexts[1], pages[1], starts, rows))
+    for step in range(2):
+        contexts[0].commit_tree_groups(groups, path, mapping, lengths, use_graph=True)
+        torch.testing.assert_close(
+            outputs[0][:, 0].cpu(), torch.tensor([3, 0 if step == 0 else 2], dtype=torch.int32)
+        )
+        torch.testing.assert_close(outputs[1][:, 0].cpu(), outputs[0][:, 0].cpu().flip(0))
+        torch.testing.assert_close(outputs[1][:, 1], pages[1])
+        torch.testing.assert_close(outputs[1][:, 3:], path.flip(0))
+        path.add_(1)
+        pages[1].add_(1)
+        mapping.fill_(0)
+    assert len(contexts[0]._tree_commit_graphs) == 1
+    assert not contexts[1]._tree_commit_graphs
+
+
 @pytest.mark.parametrize("commit_conv", [True, False])
 def test_context_reuses_plan_and_respects_commit_conv(mocked_commit, commit_conv):
     context, launches = mocked_commit

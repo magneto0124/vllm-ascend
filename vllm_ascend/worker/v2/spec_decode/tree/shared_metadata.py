@@ -30,6 +30,9 @@ class SharedGDNTreeMetadata:
     init_state_columns: torch.Tensor
     conv_window_rows: torch.Tensor
     conv_prefix_src: torch.Tensor
+    replay_paths: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
     request_id: str | None = None
     page_batch: "GDNTreePageBatch | None" = field(default=None, repr=False, compare=False)
     _written_graph_inputs: set[int] = field(default_factory=set, init=False, repr=False, compare=False)

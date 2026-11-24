@@ -15,7 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -30,6 +30,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
+from vllm_ascend.worker.v2.spec_decode.tree.preparation_graph import TreePreparationGraphs
 
 if TYPE_CHECKING:
     from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
@@ -72,6 +73,7 @@ class AscendTreeMambaHybridAttnMetadata(MambaHybridAttnMetadata):
     tree_prev_path: torch.Tensor | None = None
     tree_prev_num_sampled: torch.Tensor | None = None
     tree_depths: torch.Tensor | None = None
+    tree_full_graph: bool = False
     shared_gdn_tree: "SharedGDNTreeMetadata | None" = None
 
     def get_extra_attn_kwargs(
@@ -99,6 +101,8 @@ class AscendTreeMambaHybridAttnMetadata(MambaHybridAttnMetadata):
         if self.tree_prev_path is not None and self.tree_prev_num_sampled is not None:
             kwargs["prev_path_node_ids"] = self.tree_prev_path[:num_reqs]
             kwargs["prev_num_sampled"] = self.tree_prev_num_sampled[:num_reqs]
+        if attn_metadata_builder._TREE_RECOVERSSM:
+            kwargs["tree_full_graph"] = self.tree_full_graph
         tree = self.shared_gdn_tree
         if (
             tree is not None
@@ -159,12 +163,16 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
         if previous is not None and previous[0] is attn_groups and previous[1] == full_row:
             return previous[2]
         from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBuilder
+        from vllm_ascend.attention.gdn_recoverssm_metadata import AscendGDNRecoverSSMMetadataBuilder
         from vllm_ascend.ops.triton.spec_decode.tree.gdn_tree_pages import GDNTreePageBatch
 
         refresh_builders = {}
         for index, groups in enumerate(attn_groups):
             for group in groups:
                 builder = group.get_metadata_builder(0)
+                if type(builder) is AscendGDNRecoverSSMMetadataBuilder:
+                    if full_row and builder.spec_tree_slots == tree_slots and len(groups) == 1:
+                        refresh_builders[index] = builder
                 if type(builder) is AscendGDNHostMetadataBuilder:
                     builder.select_full_tree_inputs(
                         full_row and builder.spec_tree_slots == tree_slots, self._gdn_tree_graph_pools
@@ -174,6 +182,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
         self._gdn_tree_graph_groups = (attn_groups, full_row, refresh_builders)
         return refresh_builders
 
+    @torch.profiler.record_function("tree.prepare.model_state")
     def prepare_attn(
         self,
         input_batch: AscendInputBatch,
@@ -203,8 +212,11 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
                 for_cudagraph_capture=for_capture,
             )
+        if self.recoverssm is not None:
+            self.recoverssm.record_step(self.attn_metadata, attn_groups, for_capture=for_capture)
         return self.attn_metadata
 
+    @torch.profiler.record_function("tree.prepare.host_attention_metadata")
     def _build_tree_attention_metadata(
         self,
         input_batch: AscendInputBatch,
@@ -279,6 +291,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             tree_prev_path=tree_prev_path,
             tree_prev_num_sampled=tree_prev_num_sampled,
             tree_depths=input_batch.tree_depths,
+            tree_full_graph=cudagraph_mode == CUDAGraphMode.FULL,
         )
         # Share topology for a real, complete BS1 FULL verify.
         if (
@@ -414,6 +427,27 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
     ) -> None:
         resume_state_cursor = self._tree_resume_state_cursor
         path = self._tree_path
+        tree_rows = self._tree_is_tree_row
+        if self.recoverssm is not None and isinstance(num_sampled, torch.Tensor):
+            from vllm_ascend.attention.gdn_recoverssm_metadata import (
+                AscendGDNRecoverSSMMetadata,
+                stage_tree_commit_groups,
+            )
+
+            group_metadata = {id(meta): meta for meta in self.attn_metadata.values()}
+            tree_metadata = [
+                meta
+                for meta in group_metadata.values()
+                if isinstance(meta, AscendGDNRecoverSSMMetadata) and meta.node_path_slots is not None
+            ]
+            path = stage_tree_commit_groups(tree_metadata, path, idx_mapping)
+            if tree_metadata:
+                # A root-only verify also stores its activation in a node column.
+                tree_rows = tree_metadata[-1].spec_sequence_masks
+                resume_state_cursor = num_sampled
+                # Root-only ordinary decode also wrote a tree conv column.
+                # Preserve its sampled count so the next step advances history.
+                self._tree_num_sampled = num_sampled
         # Native chain decoding retains the upstream state lifecycle.
         if resume_state_cursor is None and path is None and self._tree_prev_path is None:
             super().postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
@@ -425,6 +459,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             and idx_mapping.device.type == "npu"
             and path is not None
             and self._tree_num_sampled is not None
+            and self.recoverssm is None
             and not self.vllm_config.speculative_config.enforce_eager
             and self.vllm_config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
@@ -439,7 +474,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 resume_state_cursor,
                 path,
                 self._tree_num_sampled,
-                self._tree_is_tree_row,
+                tree_rows,
                 num_computed_tokens,
             )
         if not committed:
@@ -448,7 +483,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 resume_state_cursor if resume_state_cursor is not None else num_sampled,
                 path,
                 self._tree_num_sampled,
-                self._tree_is_tree_row,
+                tree_rows,
                 num_computed_tokens,
             )
         self._tree_resume_state_cursor = None
@@ -467,6 +502,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             update_tree_acceptance_history_(previous_path, previous_sampled, idx_mapping, path, num_sampled, tree_rows)
         super().postprocess_state(idx_mapping, resume_state_cursor, num_computed_tokens)
 
+    @torch.profiler.record_function("tree.prepare.topology_and_replay_paths")
     def _prepare_shared_gdn_tree(
         self,
         metadata: AscendTreeMambaHybridAttnMetadata,
@@ -517,15 +553,47 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             if self._gdn_page_pointers is None:
                 self._gdn_page_pointers = GDNTreePagePointers()
             page_batch = GDNTreePageBatch(self._gdn_page_pointers)
-        metadata.shared_gdn_tree = SharedGDNTreeMetadata.create(
+        inputs = (
             metadata.tree_parents,
             metadata.tree_num_nodes,
             metadata.tree_depths,
             metadata.num_accepted_tokens,
             metadata.tree_prev_path,
             metadata.tree_prev_num_sampled,
-            conv_width,
-            request_id=request_id,
-            use_fused_topology=not self.vllm_config.scheduler_config.async_scheduling,
-            page_batch=page_batch,
+        )
+        use_fused = not self.vllm_config.scheduler_config.async_scheduling
+        path_width = self.vllm_config.num_speculative_tokens + 1 if self.recoverssm is not None else 0
+
+        def prepare(parents, nodes, depths, accepted, previous_path, previous_sampled):
+            tree = SharedGDNTreeMetadata.create(
+                parents,
+                nodes,
+                depths,
+                accepted,
+                previous_path,
+                previous_sampled,
+                conv_width,
+                use_fused_topology=use_fused,
+            )
+            if path_width:
+                from vllm_ascend.attention.gdn_recoverssm_metadata import build_tree_replay_paths
+
+                # Device-generated constant: no CPU tensor transfer during capture.
+                starts = torch.arange(2, dtype=torch.int32, device=parents.device) * tree.slots
+                tree.replay_paths[path_width] = build_tree_replay_paths(
+                    parents, nodes, starts, tree.slots, path_width
+                )
+            return tree
+
+        if use_fused and inputs[0].device.type == "npu" and not torch.npu.is_current_stream_capturing():
+            graphs = getattr(self, "_tree_topology_graphs", None)
+            if graphs is None:
+                graphs = self._tree_topology_graphs = TreePreparationGraphs()
+            tree = graphs.run((conv_width, path_width), prepare, inputs)
+        else:
+            tree = prepare(*inputs)
+        # Graph tensors persist, but page bindings and the written-input set
+        # belong to this step. Never reuse the previous step's mutable bookkeeping.
+        metadata.shared_gdn_tree = replace(
+            tree, request_id=request_id, page_batch=page_batch, replay_paths=dict(tree.replay_paths)
         )
