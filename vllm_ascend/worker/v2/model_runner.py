@@ -18,6 +18,7 @@
 #
 
 import inspect
+import json
 import logging
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -139,6 +140,7 @@ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.tree.draft_tokens import TreeDraftTokensHandler
+from vllm_ascend.worker.v2.spec_decode.tree.metrics import collect_gdn_tree_cache_stats
 from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendDFlash2TreeSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
@@ -587,6 +589,22 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.pcp_manager.set_speculator(self.speculator)
                 self.model_state.pcp_manager = self.pcp_manager
+        if self.tree_shape is not None:
+            stats = collect_gdn_tree_cache_stats(self.kv_cache_config, self.compilation_config.static_forward_context)
+            if stats["gdn_layers"]:
+                logger.info(
+                    "GDN tree cache stats %s",
+                    json.dumps(
+                        {
+                            "rank": torch.distributed.get_rank(),
+                            "recoverssm": self.cache_config.use_replayssm,
+                            "tree_slots": self.tree_shape.target_verification_width,
+                            "max_num_seqs": self.max_num_reqs,
+                            **stats,
+                        },
+                        sort_keys=True,
+                    ),
+                )
         bind_dspark_context_receiver(
             self.vllm_config,
             sparse_offload_enabled=sparse_cfg.enabled,

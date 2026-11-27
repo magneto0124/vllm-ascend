@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tree graph observations from host control flow, without device timing."""
+"""Tree graph and GDN cache statistics from host metadata."""
 
 from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from math import prod
+from typing import TYPE_CHECKING, Any
+
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 
 if TYPE_CHECKING:
     import torch
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
 @dataclass
@@ -77,3 +82,43 @@ class TreeGraphStats:
                 "workspace_bytes": sum(stats.workspaces.values()),
             }
         return result
+
+
+def collect_gdn_tree_cache_stats(
+    kv_cache_config: KVCacheConfig, forward_context: dict[str, Any]
+) -> dict[str, int]:
+    """Measure this worker's persistent GDN cache and per-request page usage."""
+    components = ("conv", "ssm", "replay")
+    pool_bytes = dict.fromkeys(components, 0)
+    request_bytes = dict.fromkeys(components, 0)
+    pages_per_request = 0
+    request_page_bytes = 0
+    layer_count = 0
+    tensors = []
+    for group in kv_cache_config.kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        for name in group.layer_names:
+            spec = group_spec.kv_cache_specs[name] if isinstance(group_spec, UniformTypeKVCacheSpecs) else group_spec
+            if not isinstance(spec, MambaSpec) or spec.mamba_type is not MambaAttentionBackendEnum.GDN_ATTN:
+                continue
+            states = forward_context[name].kv_cache
+            layer_count += 1
+            pages = 1 + spec.num_speculative_blocks
+            pages_per_request = max(pages_per_request, pages)
+            request_page_bytes += pages * spec.page_size_bytes
+            for component, state in zip(components, states):
+                pool_bytes[component] += state.nbytes
+                request_bytes[component] += pages * prod(state.shape[1:]) * state.element_size()
+                tensors.append(state)
+
+    return {
+        "gdn_layers": layer_count,
+        "cache_blocks": kv_cache_config.num_blocks,
+        "max_pages_per_request_per_layer": pages_per_request,
+        "request_page_bytes": request_page_bytes,
+        "request_payload_bytes": sum(request_bytes.values()),
+        **{f"request_{component}_bytes": count for component, count in request_bytes.items()},
+        "pool_payload_bytes": sum(pool_bytes.values()),
+        **{f"pool_{component}_bytes": count for component, count in pool_bytes.items()},
+        "shared_backing_storage_bytes": TreeGraphStats.tensor_bytes(tensors),
+    }
