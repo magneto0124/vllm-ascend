@@ -359,22 +359,22 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
         return metadata
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
-        """Validate greedy verification and reset the request's Tree state."""
+        """Validate sampling parameters and reset the request's tree state."""
         params = new_req_data.sampling_params
         if params is not None and (
-            params.temperature != 0
-            or params.logprobs is not None
+            params.logprobs is not None
             or params.logprob_token_ids
             or params.structured_outputs is not None
             or params.logit_bias
             or params.allowed_token_ids
             or params.bad_words
             or params.min_tokens
+            or params.thinking_token_budget is not None
             or params.presence_penalty != 0
             or params.frequency_penalty != 0
             or params.repetition_penalty != 1
         ):
-            raise ValueError("MegaTree requires greedy sampling without logit processors or output logprobs")
+            raise ValueError("MegaTree requires sampling without logit processors or output logprobs")
         super().add_request(req_index, new_req_data)
         # The path stored here belongs to the request that occupied this slot
         # before. A new request prefills its own conv state, so its first tree

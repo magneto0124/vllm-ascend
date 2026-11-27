@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
@@ -10,7 +11,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 
 class TreeRejectionSampler(RejectionSampler):
-    """Greedy tree verification with shared accepted-path result buffers."""
+    """Verify a tree against target samples and record the accepted path."""
 
     def __init__(self, sampler, spec_config, device: torch.device, *, async_scheduling: bool):
         super().__init__(sampler, spec_config, device)
@@ -71,11 +72,29 @@ class TreeRejectionSampler(RejectionSampler):
         acceptance.active.copy_(~is_chunked & (num_logits > 0) & (query_cu[1:] > query_cu[:-1]))
         num_verifiable_draft_nodes = tree.verifiable_draft_node_counts(query_cu, cu)
         sampled = self._sampled_buf[:num_reqs]
+        temperatures = self.sampler.sampling_states.temperature.np[input_batch.idx_mapping_np]
+        if np.any(temperatures != 0):
+            indices = input_batch.logits_indices
+            # Use logical positions for RNG. Sibling nodes share a position,
+            # and only the row on the accepted path can supply the next token.
+            target_token_ids, _ = self.sampler.sample(
+                logits,
+                input_batch.expanded_idx_mapping,
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+                input_batch.positions[indices],
+                input_batch.input_ids[indices],
+                input_batch.expanded_local_pos,
+                input_batch.seq_lens_cpu_upper_bound.numpy(),
+            )
+        else:
+            target_token_ids = logits.argmax(dim=-1)
+
         verify_tree_greedy(
             tree.tokens,
             tree.first_child,
             tree.next_sibling,
-            logits.argmax(dim=-1),
+            target_token_ids,
             cu,
             num_verifiable_draft_nodes,
             sampled,
