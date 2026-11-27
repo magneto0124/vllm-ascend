@@ -783,6 +783,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         prev_path_node_ids: torch.Tensor | None = None,
         prev_num_sampled: torch.Tensor | None = None,
         row_widths: torch.Tensor | None = None,
+        conv_op_rows: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
         """Conv tap table of every draft-tree node and the committed history.
 
@@ -791,6 +792,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         history the next step resumes from, both consumed by
         ``tree_causal_conv1d_triton``. ``(None, None)`` keeps the
         sliding-window custom operator of the linear MTP chain.
+
+        The conv operator reserves history for all replay rows, including
+        padding. ``conv_op_rows`` includes those rows when supplied.
         """
         if self.spec_tree_slots is None or self.spec_conv_window_rows is None:
             return None, None
@@ -818,7 +822,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # The committed history of every request comes first, then this
             # step's activations, which are laid out request-major over the
             # tokens each request actually verifies.
-            rows * (self.spec_conv_width - 1),
+            (conv_op_rows if conv_op_rows is not None else rows) * (self.spec_conv_width - 1),
             row_widths=row_widths,
         )
         prefix_src = compute_tree_prefix_source(
@@ -1284,6 +1288,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_spec_decode_tokens,
             non_spec_query_start_loc_cpu,
         ) = batch
+        pad_spec_decode = (
+            self.use_full_cuda_graph
+            and num_spec_decodes > 0
+            and num_prefills == 0
+            and num_decodes == 0
+            and self._can_pad_spec_decode(graph_request_count, num_spec_decode_tokens)
+        )
         if (
             self.spec_tree_slots is None
             and runtime_batch
@@ -1477,6 +1488,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                         prev_path_node_ids,
                         prev_num_sampled,
                         row_widths=spec_row_widths,
+                        conv_op_rows=graph_request_count if pad_spec_decode else num_spec_decodes,
                     )
                     if spec_init_state_indices is not None and self.spec_conv_window_rows is not None:
                         # Same packing for the state pages: the recurrent op consumes
@@ -1594,13 +1606,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_accepted_tokens=num_accepted_tokens,
             checkpoint=checkpoint,
         )
-        if (
-            self.use_full_cuda_graph
-            and num_spec_decodes > 0
-            and num_prefills == 0
-            and num_decodes == 0
-            and self._can_pad_spec_decode(graph_request_count, num_spec_decode_tokens)
-        ):
+        if pad_spec_decode:
             self._pad_spec_decode_metadata(attn_metadata, graph_request_count)
             if spec_init_state_indices is not None:
                 assert self.spec_init_state_indices is not None
@@ -1611,14 +1617,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 assert spec_conv_prefix_src is not None
                 assert self.spec_conv_window_rows is not None and self.spec_conv_prefix_src is not None
                 if self._TREE_RECOVERSSM and graph_request_count > num_spec_decodes:
-                    # Window indices address [request history, packed tokens].
-                    # The graph reserves history for inactive requests too.
-                    history_width = spec_conv_prefix_src.size(1)
-                    spec_conv_window_rows = torch.where(
-                        spec_conv_window_rows >= num_spec_decodes * history_width,
-                        spec_conv_window_rows + (graph_request_count - num_spec_decodes) * history_width,
-                        spec_conv_window_rows,
-                    )
                     self.spec_conv_prefix_src[num_spec_decodes:graph_request_count].zero_()
                 self.spec_conv_window_rows[: spec_conv_window_rows.size(0)].copy_(
                     spec_conv_window_rows, non_blocking=True
